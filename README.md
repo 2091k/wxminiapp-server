@@ -194,7 +194,7 @@ SERIAL_CATEGORY=wxminiapp
 SERIAL_WISH_COST=每次取号扣多少愿望，留空=10
 EOF
 ```
-
+![](1.png)
 ### 5.2 生成随机密钥
 
 #### ① JWT_SECRET（后台登录签名用）
