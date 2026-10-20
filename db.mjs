@@ -22,6 +22,28 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 
+/** 后台「导出全部数据」白名单：key=下载标识，value=导出 SQL（只导业务列，不导 session_key 等敏感字段） */
+const EXPORT_TABLES = {
+  users:     'SELECT id,openid,nickname,phone,xpay_count,xpay_total,xpay_spent,status,remark,created_at FROM users ORDER BY id',
+  orders:    'SELECT id,outTradeNo,userId,openid,productId,productName,goodsPrice,buyQuantity,times,status,mock,note,createdAt,deliveredAt FROM orders ORDER BY createdAt DESC',
+  serials:   'SELECT id,user_id,openid,serial,category,version,source,cost,status,activated_at,claimed_at,remark FROM user_serials ORDER BY id',
+  codes:     'SELECT id,user_id,openid,kind,mac,code,cost,created_at,remark FROM user_codes ORDER BY id',
+  referrals: 'SELECT id,inviter_id,invitee_id,wish,created_at FROM referrals ORDER BY id',
+  logs:      'SELECT id,user_id,action,detail,ip,nickname,openid,created_at FROM logs ORDER BY id',
+};
+
+/**
+ * 整表恢复导入白名单：key=与导出一致的标识，table=真实表名，columns=按导出列原样写回。
+ * 整表替换：先 DELETE 再 INSERT（保留原 id / 时间），users 不走这里（按ID更新，见 importUsers）。
+ */
+const IMPORT_TABLES = {
+  logs:      { table: 'logs',         columns: ['id','user_id','action','detail','ip','nickname','openid','created_at'] },
+  orders:    { table: 'orders',       columns: ['id','outTradeNo','userId','openid','productId','productName','goodsPrice','buyQuantity','times','status','mock','note','createdAt','deliveredAt'] },
+  serials:   { table: 'user_serials', columns: ['id','user_id','openid','serial','category','version','source','cost','status','activated_at','claimed_at','remark'] },
+  codes:     { table: 'user_codes',   columns: ['id','user_id','openid','kind','mac','code','cost','created_at','remark'] },
+  referrals: { table: 'referrals',    columns: ['id','inviter_id','invitee_id','wish','created_at'] },
+};
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY,
@@ -87,6 +109,13 @@ CREATE TABLE IF NOT EXISTS counters (
   value INTEGER NOT NULL DEFAULT 0
 );
 
+-- 后台可配置项（key-value）：如取号消耗 serial_wish_cost、单个验证码消耗 socket_cost
+CREATE TABLE IF NOT EXISTS settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+
 -- 用户领取的序列号（一期：首绑手机号免费 1 个）
 --   serial       与序列号后台的号一一对应，UNIQUE 兜住"并发拿到同一个号"
 --   request_id   幂等键，连点/重试不会重复发号
@@ -146,6 +175,17 @@ CREATE TABLE IF NOT EXISTS code_batches (
   cost       INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER
 );
+
+-- 邀请记录：一个被邀请人只能绑一个邀请人（UNIQUE 兜住并发/重复提交）
+--   wish 发放当时后台配置的邀请奖励（0 = 只是记录，不给愿望）
+CREATE TABLE IF NOT EXISTS referrals (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  inviter_id INTEGER NOT NULL,
+  invitee_id INTEGER NOT NULL UNIQUE,
+  wish       INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ref_inviter ON referrals(inviter_id, created_at DESC);
 `;
 
 export class SQLiteDB {
@@ -178,6 +218,23 @@ export class SQLiteDB {
     // 客户端删除（软删除）：只在用户自己那边隐藏，后台照样能看到
     addCol('user_serials', 'hidden', 'hidden INTEGER NOT NULL DEFAULT 0');
     addCol('user_codes', 'hidden', 'hidden INTEGER NOT NULL DEFAULT 0');
+    // 邀请制：邀请人ID / 绑定时间 / 是否已发过「新用户注册赠送愿望」
+    addCol('users', 'invited_by', 'invited_by INTEGER NOT NULL DEFAULT 0');
+    addCol('users', 'invited_at', 'invited_at INTEGER NOT NULL DEFAULT 0');
+    addCol('users', 'new_gift', 'new_gift INTEGER NOT NULL DEFAULT 0');
+  }
+
+  // ─────────── settings（后台可配置项 key-value） ───────────
+
+  getSetting(key, def = '') {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(String(key));
+    return row ? String(row.value) : def;
+  }
+
+  setSetting(key, value) {
+    this.db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+      .run(String(key), String(value), Math.floor(Date.now() / 1000));
   }
 
   // ─────────── users ───────────
@@ -219,8 +276,197 @@ export class SQLiteDB {
     `).get();
     return Number(r.value);
   }
+
+  /**
+   * 找从 1 起最小未被占用的用户ID（删除用户后补空洞，而不是一直往后增长）。
+   * 仅计算候选号，真正落库由调用方完成；并发撞号时调用方重算重试。
+   */
+  findFreeUserId() {
+    const rows = this.db.prepare('SELECT id FROM users').all();
+    const used = new Set(rows.map(r => Number(r.id)));
+    let n = 1;
+    while (used.has(n)) n++;
+    return n;
+  }
+
+  /**
+   * 改用户ID（管理员在编辑里手动指定）。
+   * 事务内改 users.id，并级联 orders.userId / user_serials.user_id / user_codes.user_id，
+   * 保证订单、领号、插座记录不断链；logs 保留原值（审计留痕）。
+   * @returns {boolean} false = 源不存在 / 新号非法 / 新号已被占用
+   */
+  renameUserId(oldId, newId) {
+    oldId = Number(oldId); newId = Number(newId);
+    if (!Number.isInteger(oldId) || !Number.isInteger(newId) || oldId <= 0 || newId <= 0 || oldId === newId) return false;
+    if (!this.db.prepare('SELECT id FROM users WHERE id = ?').get(oldId)) return false;
+    if (this.db.prepare('SELECT id FROM users WHERE id = ?').get(newId)) return false;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('UPDATE users SET id = ? WHERE id = ?').run(newId, oldId);
+      this.db.prepare('UPDATE orders SET userId = ? WHERE userId = ?').run(newId, oldId);
+      this.db.prepare('UPDATE user_serials SET user_id = ? WHERE user_id = ?').run(newId, oldId);
+      this.db.prepare('UPDATE user_codes SET user_id = ? WHERE user_id = ?').run(newId, oldId);
+      this.db.exec('COMMIT');
+      return true;
+    } catch (e) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw e;
+    }
+  }
   listAllUsers(limit) {
     return this.db.prepare('SELECT * FROM users ORDER BY id DESC LIMIT ?').all(Number(limit) || 1000);
+  }
+
+  /** 今日新增（数据库按时间全表统计，不受列表扫描上限限制）：created_at >= 起始秒 */
+  countUsersCreatedAfter(ts) {
+    return Number(this.db.prepare('SELECT COUNT(*) AS c FROM users WHERE created_at >= ?').get(Number(ts) || 0).c || 0);
+  }
+
+  /** 合计：总用户数 / 累计消费(分) / 当前剩余愿望，一条 SQL 聚合（全表，突破扫描上限） */
+  getUserTotals() {
+    const row = this.db.prepare(
+      'SELECT COUNT(*) AS total, COALESCE(SUM(xpay_spent),0) AS spent, COALESCE(SUM(xpay_count),0) AS count FROM users'
+    ).get();
+    return {
+      total: Number(row.total || 0),
+      spent: Number(row.spent || 0),
+      count: Number(row.count || 0)
+    };
+  }
+
+  /** 清空全部订单（后台「清空订单列表」），返回删除条数。事务执行。 */
+  clearAllOrders() {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const r = this.db.prepare('DELETE FROM orders').run();
+      this.db.exec('COMMIT');
+      return Number(r.changes || 0);
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+  }
+
+  /** 清空全部审计日志（后台「清空审计日志」），返回删除条数。事务执行。 */
+  clearAllLogs() {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const r = this.db.prepare('DELETE FROM logs').run();
+      this.db.exec('COMMIT');
+      return Number(r.changes || 0);
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+  }
+
+  /**
+   * 批量导入 / 修改用户（按用户ID匹配，只更新已存在用户，ID 不存在则跳过）。
+   * @param {Array<{id:number|string, xpay_count?:number|string, nickname?:string, phone?:string}>} rows
+   *   xpay_count 提供即「设置为该值」（非负整数），留空不改；nickname/phone 留空不改。
+   * @returns {{updated:number, skipped:number, errors:string[]}}
+   */
+  importUsers(rows) {
+    let updated = 0, skipped = 0;
+    const errors = [];
+    const now = Math.floor(Date.now() / 1000);
+    const sel = this.db.prepare('SELECT * FROM users WHERE id = ?');
+    const upd = this.db.prepare(
+      'UPDATE users SET xpay_count = ?, nickname = ?, phone = ?, updated_at = ? WHERE id = ?'
+    );
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows || []) {
+        const id = Number(row.id);
+        if (!Number.isInteger(id) || id <= 0) { errors.push(`非法用户ID：${row.id}`); skipped++; continue; }
+        const cur = sel.get(id);
+        if (!cur) { errors.push(`ID ${id} 不存在，已跳过`); skipped++; continue; }
+        let balance = Number(cur.xpay_count || 0);
+        let nick = cur.nickname || '';
+        let phone = cur.phone || '';
+        const bRaw = row.xpay_count;
+        if (bRaw !== undefined && bRaw !== null && String(bRaw).trim() !== '') {
+          const n = Math.floor(Number(bRaw));
+          if (!Number.isInteger(n) || n < 0) { errors.push(`ID ${id} 余额「${bRaw}」非法，已跳过该行`); continue; }
+          balance = n;
+        }
+        if (row.nickname !== undefined && String(row.nickname).trim() !== '') nick = String(row.nickname).slice(0, 100);
+        if (row.phone !== undefined && String(row.phone).trim() !== '') phone = String(row.phone).slice(0, 30);
+        upd.run(balance, nick, phone, now, id);
+        updated++;
+      }
+      this.db.exec('COMMIT');
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+    return { updated, skipped, errors };
+  }
+
+  /**
+   * 整表恢复导入（先清空该表，再按 CSV 原样写回，保留原 id / 时间）。
+   * @param {string} key IMPORT_TABLES 的标识：logs/orders/serials/codes/referrals
+   * @param {Array<object>} rows 已按列名映射好的行对象
+   * @returns {{ok:boolean,table?:string,inserted:number,error?:string}}
+   */
+  replaceTable(key, rows) {
+    const map = IMPORT_TABLES[key];
+    if (!map) return { ok: false, error: 'unknown_table', inserted: 0 };
+    const cols = map.columns;
+    const ph = cols.map(() => '?').join(',');
+    const ins = this.db.prepare(`INSERT INTO ${map.table} (${cols.join(',')}) VALUES (${ph})`);
+    let inserted = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`DELETE FROM ${map.table}`).run();
+      try { this.db.prepare('DELETE FROM sqlite_sequence WHERE name = ?').run(map.table); } catch {}
+      for (const row of rows || []) {
+        const vals = cols.map(c => (row[c] === undefined || row[c] === null || row[c] === '') ? null : row[c]);
+        ins.run(...vals);
+        inserted++;
+      }
+      this.db.exec('COMMIT');
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+    return { ok: true, table: map.table, inserted };
+  }
+
+  /**
+   * 全表导出（白名单），返回 { columns, rows }；不在白名单内的表返回 null。
+   */
+  dumpTable(name) {
+    const sql = EXPORT_TABLES[name];
+    if (!sql) return null;
+    const stmt = this.db.prepare(sql);
+    let columns = [];
+    try { columns = (stmt.columns() || []).map(c => c.name); } catch { columns = []; }
+    const rows = stmt.all();
+    if (!columns.length && rows.length) columns = Object.keys(rows[0]);
+    return { columns, rows };
+  }
+
+
+  /**
+   * 批量硬删除用户（管理员后台「批量删除」）。
+   * 事务内清理 users 及其领取记录：user_serials / user_codes / code_batches；
+   * orders（支付与对账凭证）与 logs（审计留痕）保留，不因删用户而丢失。
+   * @param {number[]} ids 用户ID数组（内部去重、过滤非正整数）
+   * @returns {{deleted:number, removed:Array<{id:number,openid:string,nickname:string,phone:string,xpay_count:number}>}}
+   */
+  deleteUsers(ids) {
+    const idList = [...new Set((ids || [])
+      .map(x => Number(x))
+      .filter(n => Number.isInteger(n) && n > 0))];
+    if (!idList.length) return { deleted: 0, removed: [] };
+
+    const placeholders = idList.map(() => '?').join(',');
+    // 先取快照（审计日志 / 回显用），再在同一事务里删除
+    const removed = this.db.prepare(
+      `SELECT id, openid, nickname, phone, xpay_count FROM users WHERE id IN (${placeholders})`
+    ).all(...idList);
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`DELETE FROM user_serials WHERE user_id IN (${placeholders})`).run(...idList);
+      this.db.prepare(`DELETE FROM user_codes WHERE user_id IN (${placeholders})`).run(...idList);
+      this.db.prepare(`DELETE FROM code_batches WHERE user_id IN (${placeholders})`).run(...idList);
+      const r = this.db.prepare(`DELETE FROM users WHERE id IN (${placeholders})`).run(...idList);
+      this.db.exec('COMMIT');
+      return { deleted: Number(r.changes) || 0, removed };
+    } catch (e) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw e;
+    }
   }
 
   // ─────────── orders ───────────
@@ -414,6 +660,161 @@ export class SQLiteDB {
   deleteUserSerial(serial) {
     return this.db.prepare('DELETE FROM user_serials WHERE serial = ?').run(String(serial)).changes;
   }
+
+  // ─────────── 邀请制（referrals / users.invited_by） ───────────
+
+  /** 这个用户是被谁邀请的（没绑过返回 undefined） */
+  getReferralByInvitee(inviteeId) {
+    return this.db.prepare('SELECT * FROM referrals WHERE invitee_id = ?').get(Number(inviteeId));
+  }
+
+  /** 我邀请了几个人 */
+  countInvited(inviterId) {
+    return Number(this.db.prepare(
+      'SELECT COUNT(*) AS c FROM referrals WHERE inviter_id = ?'
+    ).get(Number(inviterId)).c || 0);
+  }
+
+  /** 我靠邀请一共拿到多少愿望 */
+  sumInviteWish(inviterId) {
+    return Number(this.db.prepare(
+      'SELECT COALESCE(SUM(wish), 0) AS s FROM referrals WHERE inviter_id = ?'
+    ).get(Number(inviterId)).s || 0);
+  }
+
+  /**
+   * 新用户注册赠送愿望：只发一次（new_gift 标记兜底，重启/并发都不会重复发）
+   * @returns {{ok:boolean, granted:boolean, wish:number}}
+   */
+  grantNewUserGiftTx({ userId, wish }) {
+    const w = Math.max(0, Math.floor(Number(wish) || 0));
+    const ts = Math.floor(Date.now() / 1000);
+    if (w === 0) {
+      // 配置为 0：只打标记，不加愿望
+      this.db.prepare('UPDATE users SET new_gift = 1, updated_at = ? WHERE id = ? AND new_gift = 0')
+        .run(ts, Number(userId));
+      return { ok: true, granted: false, wish: 0 };
+    }
+    const r = this.db.prepare(
+      'UPDATE users SET xpay_count = xpay_count + ?, new_gift = 1, updated_at = ? WHERE id = ? AND new_gift = 0'
+    ).run(w, ts, Number(userId));
+    return { ok: true, granted: Number(r.changes) === 1, wish: Number(r.changes) === 1 ? w : 0 };
+  }
+
+  /**
+   * 绑定邀请关系 + 给邀请人发愿望（一个事务）
+   * 失败原因：self / already_bound / inviter_not_found / invitee_missing / window_expired(调用方判)
+   */
+  bindReferralTx({ inviterId, inviteeId, wish }) {
+    const inviter = Number(inviterId);
+    const invitee = Number(inviteeId);
+    const w = Math.max(0, Math.floor(Number(wish) || 0));
+    const ts = Math.floor(Date.now() / 1000);
+
+    if (!inviter || !invitee) return { ok: false, error: 'bad_id' };
+    if (inviter === invitee) return { ok: false, error: 'self' };
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const me = this.db.prepare('SELECT id, invited_by FROM users WHERE id = ?').get(invitee);
+      if (!me) { this.db.exec('ROLLBACK'); return { ok: false, error: 'invitee_missing' }; }
+      if (Number(me.invited_by) > 0) { this.db.exec('ROLLBACK'); return { ok: false, error: 'already_bound' }; }
+
+      const other = this.db.prepare('SELECT id FROM users WHERE id = ?').get(inviter);
+      if (!other) { this.db.exec('ROLLBACK'); return { ok: false, error: 'inviter_not_found' }; }
+
+      this.db.prepare(
+        'INSERT INTO referrals (inviter_id, invitee_id, wish, created_at) VALUES (?, ?, ?, ?)'
+      ).run(inviter, invitee, w, ts);
+
+      const r = this.db.prepare(
+        'UPDATE users SET invited_by = ?, invited_at = ?, updated_at = ? WHERE id = ? AND invited_by = 0'
+      ).run(inviter, ts, ts, invitee);
+      if (Number(r.changes) !== 1) { this.db.exec('ROLLBACK'); return { ok: false, error: 'already_bound' }; }
+
+      if (w > 0) {
+        this.db.prepare('UPDATE users SET xpay_count = xpay_count + ?, updated_at = ? WHERE id = ?')
+          .run(w, ts, inviter);
+      }
+
+      this.db.exec('COMMIT');
+      return { ok: true, wish: w, at: ts };
+    } catch (e) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      const msg = String((e && e.message) || e);
+      if (/referrals\.invitee_id/i.test(msg)) return { ok: false, error: 'already_bound' };
+      return { ok: false, error: 'db_error', message: msg };
+    }
+  }
+
+  /** 后台：邀请记录（带昵称/手机号，便于查异常） */  listReferrals({ limit = 100, offset = 0 } = {}) {
+    return this.db.prepare(`
+      SELECT r.*, i.nickname AS inviter_nick, i.phone AS inviter_phone,
+             e.nickname AS invitee_nick, e.phone AS invitee_phone
+        FROM referrals r
+        LEFT JOIN users i ON i.id = r.inviter_id
+        LEFT JOIN users e ON e.id = r.invitee_id
+       ORDER BY r.id DESC LIMIT ? OFFSET ?
+    `).all(Number(limit) || 100, Number(offset) || 0);
+  }
+
+  countReferrals() {
+    return Number(this.db.prepare('SELECT COUNT(*) AS c FROM referrals').get().c || 0);
+  }
+
+  /**
+   * 后台：取消一条邀请绑定（解绑）
+   *   · 删掉 referrals 记录 + 把被邀请人的 invited_by 清 0（他之后可以重新填邀请人）
+   *   · reclaim=true 时向邀请人收回当初发的愿望；余额不够就按现有余额收回（不扣成负数）
+   * @returns {{ok:boolean, error?:string, inviter_id?:number, wish?:number, reclaimed?:number}}
+   */
+  cancelReferralTx({ inviteeId, reclaim = false }) {
+    const id = Number(inviteeId);
+    const ts = Math.floor(Date.now() / 1000);
+    if (!id) return { ok: false, error: 'bad_id' };
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const ref = this.db.prepare('SELECT * FROM referrals WHERE invitee_id = ?').get(id);
+      if (!ref) {
+        this.db.exec('ROLLBACK');
+        return { ok: false, error: 'not_bound' };
+      }
+
+      this.db.prepare('DELETE FROM referrals WHERE invitee_id = ?').run(id);
+      this.db.prepare(
+        'UPDATE users SET invited_by = 0, invited_at = 0, updated_at = ? WHERE id = ?'
+      ).run(ts, id);
+
+      let reclaimed = 0;
+      const wish = Number(ref.wish || 0);
+      if (reclaim && wish > 0) {
+        const row = this.db.prepare('SELECT xpay_count FROM users WHERE id = ?').get(Number(ref.inviter_id));
+        const bal = Number((row && row.xpay_count) || 0);
+        reclaimed = Math.max(0, Math.min(bal, wish));
+        if (reclaimed > 0) {
+          this.db.prepare('UPDATE users SET xpay_count = xpay_count - ?, updated_at = ? WHERE id = ?')
+            .run(reclaimed, ts, Number(ref.inviter_id));
+        }
+      }
+
+      this.db.exec('COMMIT');
+      return { ok: true, inviter_id: Number(ref.inviter_id), wish, reclaimed };
+    } catch (e) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      return { ok: false, error: 'db_error', message: String((e && e.message) || e) };
+    }
+  }
+
+  /** 后台：每个用户邀请了多少人（user_id → 数量） */
+  countInvitesByUser() {
+    const rows = this.db.prepare(
+      'SELECT inviter_id, COUNT(*) AS c FROM referrals GROUP BY inviter_id'
+    ).all();
+    const map = {};
+    for (const r of rows) map[Number(r.inviter_id)] = Number(r.c);
+    return map;
+  }
   /** 后台：每个用户领了多少个（user_id → 数量） */
   countSerialsByUser() {
     const rows = this.db.prepare(
@@ -538,6 +939,22 @@ export class SQLiteDB {
   }
   countAllCodes() {
     return Number(this.db.prepare('SELECT COUNT(*) AS c FROM user_codes').get().c || 0);
+  }
+  /**
+   * 有效用户（去重并集）：购买过(已发货订单) / 取过号(user_serials) / 生成过验证码(user_codes)。
+   * 不再以"当前剩余愿望>0"判定，避免用完余额就被算作无效。
+   */
+  countActiveUsers() {
+    const row = this.db.prepare(`
+      SELECT COUNT(DISTINCT uid) AS c FROM (
+        SELECT userId AS uid FROM orders WHERE status = 'delivered'
+        UNION
+        SELECT user_id AS uid FROM user_serials
+        UNION
+        SELECT user_id AS uid FROM user_codes
+      )
+    `).get();
+    return Number(row.c || 0);
   }
   /** 后台：删掉一条验证码记录（不改愿望余额） */
   deleteUserCode(id) {

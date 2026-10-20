@@ -140,41 +140,45 @@ const bStatus = async (serial) => {
   return (await res.json()).list[0];
 };
 
-// ═══════════ 1. 鉴权与手机号门槛 ═══════════
+// ═══════════ 1. 鉴权与愿望门槛（邀请制：没有免费额度，也没有手机号门槛） ═══════════
 {
   const noToken = await claim(undefined, CAT, 'req_no_token_01');
   ok(noToken.status === 401, '未登录取号应 401', noToken.status);
 
   const u1 = userToken(1);
-  const noPhone = await claim(u1, CAT, 'req_nophone_001');
-  ok(noPhone.status === 400 && noPhone.json.error === 'need_phone',
-    '未绑手机号应返回 need_phone', noPhone.json);
-  ok(kv.lines().every((l) => !l.includes('已领取')), '被手机号门槛拦下时不应占用号', kv.lines());
+  const noWish = await claim(u1, CAT, 'req_nowish_0001');
+  ok(noWish.status === 402 && noWish.json.error === 'need_wish',
+    '愿望不足时应 402 need_wish（不再要求手机号）', noWish.json);
+  ok(noWish.json.need === 10, '应告诉需要多少愿望', noWish.json.need);
+  ok(kv.lines().every((l) => !l.includes('已领取')), '愿望不足时不应占用号', kv.lines());
 }
 
-// ═══════════ 2. 首免：正常取号 ═══════════
+// ═══════════ 2. 邀请制取号：扣 10 个愿望，source=wish ═══════════
 let firstSerial = '';
 {
-  db.putUser({ ...db.getUserById(1), phone: '13900000001' });
+  // 没绑手机号也能取号（手机号只是资料，不再是门槛）
+  db.putUser({ ...db.getUserById(1), xpay_count: 10 });
   const u1 = userToken(1);
 
   const r = await claim(u1, CAT, 'req_first_0001');
-  ok(r.status === 200 && r.json.ok && r.json.serial, '绑手机号后应能取号', r.json);
-  ok(r.json.source === 'free' && r.json.status === 'issued', '首免来源与状态应正确', r.json);
+  ok(r.status === 200 && r.json.ok && r.json.serial, '有愿望时应能取号', r.json);
+  ok(r.json.source === 'wish' && r.json.cost === 10 && r.json.status === 'issued',
+    '取号来源应为扣愿望、消耗 10 个', r.json);
   firstSerial = r.json.serial;
   ok(firstSerial === `${CAT}-S1`, '应按池子顺序发第一个号', firstSerial);
+  ok(r.json.wish_left === 0, '取号后愿望应扣光', r.json.wish_left);
 
   const st = await bStatus(firstSerial);
   ok(st.status === 'issued', '序列号后台应变成「已领取」', st);
 
   const row = db.getUserSerial(firstSerial);
-  ok(row && row.user_id === 1 && row.source === 'free' && row.status === 'issued',
-    '本地应落一条 source=free 的记录', row);
+  ok(row && row.user_id === 1 && row.source === 'wish' && row.cost === 10 && row.status === 'issued',
+    '本地应落一条 source=wish、cost=10 的记录', row);
 
-  // 再取（新 request_id）→ 免费用完、愿望 0 → need_wish（二期：不再直接拒绝，而是要扣愿望）
+  // 再取（换 request_id）→ 愿望是 0 → need_wish
   const again = await claim(u1, CAT, 'req_first_0002');
   ok(again.json.ok === false && again.json.error === 'need_wish',
-    '免费额度用完后（愿望不足）应 need_wish', again.json);
+    '愿望不足时应 need_wish', again.json);
 
   // 幂等重放
   const replay = await claim(u1, CAT, 'req_first_0001');
@@ -205,7 +209,9 @@ let firstSerial = '';
   const u1 = userToken(1);
   const m1 = await mine(u1, { sync: true });
   ok(m1.json.ok && m1.json.list.length === 1, '我的列表应有 1 个号', m1.json);
-  ok(m1.json.free_used === true && m1.json.phone_bound === true, '额度与手机号状态应正确', m1.json);
+  ok(m1.json.free_used === true && m1.json.free_left === 0, '邀请制下不再有免费额度', m1.json);
+  ok(m1.json.phone_bound === false, '没绑手机号也应能取号（手机号不是门槛）', m1.json.phone_bound);
+  ok(m1.json.wish_left === 0 && m1.json.cost === 10, '应返回剩余愿望与单次消耗', m1.json);
   const item = m1.json.list[0];
   ok(item.status === 'issued' && item.status_text === '未激活', '激活前状态应为未激活', item);
   ok(item.category === CAT && item.serial === firstSerial, '号与分类应对上', item);
@@ -226,12 +232,13 @@ let firstSerial = '';
   // 模拟：A 里已经有 CAT-S3（属于用户 999），但 B 那边丢了写入、仍认为 S3 可用
   db.addUserSerial({
     user_id: 999, openid: 'openid-999', serial: `${CAT}-S3`, category: CAT,
-    source: 'free', cost: 0, request_id: 'req_orphan_001',
+    source: 'wish', cost: 10, request_id: 'req_orphan_001',
     status: 'issued', claimed_at: nowSec(), synced_at: 0,
   });
   const stS3 = await bStatus(`${CAT}-S3`);
   ok(stS3.status === 'available', 'B 侧此时仍认为 S3 可发放（模拟状态不一致）', stS3);
 
+  db.putUser({ ...db.getUserById(2), xpay_count: 10 });   // 取号要扣愿望，先给够
   const u2 = userToken(2);
   const r = await claim(u2, CAT, 'req_retry_0001');
   ok(r.json.ok, '冲突时应自动换号重试成功', r.json);
@@ -248,14 +255,16 @@ let firstSerial = '';
   kv.map.set('bt_list', kv.lines().filter((l) => !l.includes('Z-')).join('\n'));
   // 把 CAT 下所有号都清掉，换成一个空分类
   kv.map.set('bt_list', [`${CAT}-S1|DEV-AAA|2026-01-01 10:00:00|已激活|n|${CAT}`].join('\n'));
-  const u2 = userToken(2);   // 用户 2 已经用过免费额度、且愿望为 0
+  const u2 = userToken(2);   // 用户 2 愿望已经扣光
   const r = await claim(u2, CAT, 'req_oos_000001');
-  ok(r.json.ok === false && r.json.error === 'need_wish', '用户2 免费用过且没愿望应 need_wish', r.json);
+  ok(r.json.ok === false && r.json.error === 'need_wish', '用户2 没愿望应 need_wish', r.json);
 
-  const u3 = userToken(3);   // 用户 3 未取过，但池子里没有可用号
+  db.putUser({ ...db.getUserById(3), xpay_count: 10 });   // 给用户 3 愿望
+  const u3 = userToken(3);
   const r3 = await claim(u3, CAT, 'req_oos_000002');
   ok(r3.json.ok === false && r3.json.error === 'out_of_stock', '号池空应返回 out_of_stock', r3.json);
   ok(db.listUserSerials(3, 10, 0).length === 0, '号池空时不应落库', db.listUserSerials(3, 10, 0).length);
+  ok(Number(db.getUserById(3).xpay_count) === 10, '号池空时不应扣愿望', db.getUserById(3).xpay_count);
 }
 
 // ═══════════ 6. 序列号后台不可达时，我的页面不能崩 ═══════════
@@ -314,9 +323,10 @@ let firstSerial = '';
   const me = await aCall('/api/user/me', { token: u4 });
   ok(me.json.user.phone === '13800138000', '/api/user/me 应带出手机号', me.json.user.phone);
 
-  // 绑好手机号后能正常取号（首免）；分类由 env 指定，这里传一个错的也应被忽略
+  // 绑好手机号后能正常取号（现在取号只需要愿望，手机号只是资料）
+  db.putUser({ ...db.getUserById(4), xpay_count: 10 });
   const r = await claim(u4, 'WRONG-CAT', 'req_phone_0001', { ...aEnv, SERIAL_CATEGORY: 'PHONE-CAT' });
-  ok(r.json.ok && r.json.serial === 'PHONE-S1', '绑手机号后应能取号（分类用服务端配置）', r.json);
+  ok(r.json.ok && r.json.serial === 'PHONE-S1', '有愿望后应能取号（分类用服务端配置）', r.json);
 
   // 再绑一次（换号）应覆盖，且不影响已领的号
   const rebind = await aCall('/api/user/phone', { method: 'POST', token: u4, body: { phone: '13900139000' } });
@@ -331,6 +341,7 @@ let firstSerial = '';
 
   // 没配 SERIAL_CATEGORY → 用代码里的默认值 wxminiapp
   makeUser(5, 'openid-5', '13900000005');
+  db.putUser({ ...db.getUserById(5), xpay_count: 10 });
   const envDefault = { ...aEnv, SERIAL_CATEGORY: '' };
   const r1 = await aCall('/api/serial/claim', {
     method: 'POST', token: userToken(5), env: envDefault,
@@ -342,6 +353,7 @@ let firstSerial = '';
   // 配了 SERIAL_CATEGORY → 以它为准（客户端传 wxminiapp 也不作数）
   kv.map.set('bt_list', ['FIXED-S1|||||wxminiapp', 'FIXED-S2|||||OTHER-CAT'].join('\n'));
   makeUser(6, 'openid-6', '13900000006');
+  db.putUser({ ...db.getUserById(6), xpay_count: 10 });
   const envExplicit = { ...aEnv, SERIAL_CATEGORY: 'OTHER-CAT' };
   const r2 = await aCall('/api/serial/claim', {
     method: 'POST', token: userToken(6), env: envExplicit,
@@ -353,6 +365,7 @@ let firstSerial = '';
   // 固定分类里没号时，明确 out_of_stock（而不是去别的分类捞）
   kv.map.set('bt_list', ['ONLY-OTHER|||||OTHER-CAT'].join('\n'));
   makeUser(7, 'openid-7', '13900000007');
+  db.putUser({ ...db.getUserById(7), xpay_count: 10 });
   const r3 = await aCall('/api/serial/claim', {
     method: 'POST', token: userToken(7), env: { ...aEnv, SERIAL_CATEGORY: 'wxminiapp' },
     body: { request_id: 'req_fixed_0003' },
@@ -364,7 +377,8 @@ let firstSerial = '';
 // ═══════════ 10. 后台删除发放记录 → 用户可以重新领 ═══════════
 {
   makeUser(8, 'openid-8', '13900000008');
-  kv.map.set('bt_list', ['DEL-S1|||||DEL-CAT', 'DEL-S2|||||DEL-CAT'].join('\n'));
+  db.putUser({ ...db.getUserById(8), xpay_count: 20 });
+  kv.map.set('bt_list', ['DEL-S1|||||DEL-CAT', 'DEL-S2|||||DEL-CAT', 'DEL-S3|||||DEL-CAT'].join('\n'));
   const envDel = { ...aEnv, SERIAL_CATEGORY: 'DEL-CAT' };
   const u8 = userToken(8);
 
@@ -376,13 +390,14 @@ let firstSerial = '';
     }), envDel, {});
   }
 
-  // ① 首免领一个
+  // ① 扣愿望领一个
   const first = await claim(u8, '', 'req_del_00001', envDel);
-  ok(first.json.ok && first.json.serial === 'DEL-S1', '首次应领到 DEL-S1', first.json);
+  ok(first.json.ok && first.json.serial === 'DEL-S1' && first.json.cost === 10,
+    '首次应扣 10 愿望并领到 DEL-S1', first.json);
 
-  // ② 再领：免费用完且愿望 0 → need_wish
+  // ② 再领一个（还剩 10 愿望）
   const again = await claim(u8, '', 'req_del_00002', envDel);
-  ok(again.json.ok === false && again.json.error === 'need_wish', '免费用过（无愿望）应 need_wish', again.json);
+  ok(again.json.ok && again.json.serial === 'DEL-S2', '第二次应领到 DEL-S2', again.json);
 
   // ③ 后台「删除·退回池」
   const del = await adminDelete('DEL-S1', 'release');
@@ -391,9 +406,10 @@ let firstSerial = '';
   const backSt = await bStatus('DEL-S1');
   ok(backSt.status === 'available', '号应退回可发放池', backSt);
 
-  // ④ 免费额度被释放 → 又能领，且拿回刚退的号
+  // ④ 删除后可以再领（再扣 10 愿望），并拿回刚退的号
+  db.putUser({ ...db.getUserById(8), xpay_count: 10 });
   const m1 = await mine(u8, { sync: true, env: envDel });
-  ok(m1.json.free_used === false && m1.json.list.length === 0, '删除后免费额度应释放', m1.json);
+  ok(m1.json.free_used === true && m1.json.list.length === 1, '删除后记录只剩 1 条（没有免费额度这回事）', m1.json);
   const re = await claim(u8, '', 'req_del_00003', envDel);
   ok(re.json.ok && re.json.serial === 'DEL-S1', '删除后应能重新领取并拿到退回的号', re.json);
 
@@ -409,9 +425,10 @@ let firstSerial = '';
   ok(voidSt.status === 'void', '已激活的号应被作废而不是回池', voidSt);
   ok((await activate('DEL-S1', 'DEV-DEL2')) === 'off', '作废后不能再激活');
 
-  // ⑥ 作废旧的号后，仍能领到下一个号
+  // ⑥ 作废旧的号后，仍能领到下一个号（再给 10 愿望）
+  db.putUser({ ...db.getUserById(8), xpay_count: 10 });
   const re2 = await claim(u8, '', 'req_del_00004', envDel);
-  ok(re2.json.ok && re2.json.serial === 'DEL-S2', '还能领到下一个可用号', re2.json);
+  ok(re2.json.ok && re2.json.serial === 'DEL-S3', '还能领到下一个可用号', re2.json);
 
   // ⑦ 未登录不能删
   const noAuth = await aWorker.fetch(new Request('https://api.test/admin/serials/delete', {
@@ -600,7 +617,7 @@ let firstSerial = '';
     '预览请求（page_size=2）也应返回正确总数与额度', { total: preview.json.total, free_used: preview.json.free_used });
 }
 
-// ═══════════ 15. 二期：首免之后每次扣 10 个愿望 ═══════════
+// ═══════════ 15. 邀请制：每次取号都扣 10 个愿望（没有首免） ═══════════
 {
   makeUser(11, 'openid-11', '13900000011');
   db.putUser({ ...db.getUserById(11), xpay_count: 25, xpay_total: 30 });
@@ -608,31 +625,27 @@ let firstSerial = '';
   const envW = { ...aEnv, SERIAL_CATEGORY: 'WISH-CAT' };
   const u11 = userToken(11);
 
-  // ① 第一次：免费，不扣愿望
+  // ① 第一次就扣 10（不再有免费额度）
   const f = await claim(u11, '', 'req_wish_00001', envW);
-  ok(f.json.ok && f.json.source === 'free' && f.json.cost === 0, '首次应免费', f.json);
-  ok(db.getUserById(11).xpay_count === 25, '免费那次不扣愿望', db.getUserById(11).xpay_count);
-  ok(db.getUserSerial('W1').source === 'free', '落库来源应为 free', db.getUserSerial('W1').source);
+  ok(f.json.ok && f.json.source === 'wish' && f.json.cost === 10, '第一次就应扣 10 个愿望', f.json);
+  ok(db.getUserById(11).xpay_count === 15, '余额应从 25 扣到 15', db.getUserById(11).xpay_count);
+  ok(db.getUserSerial('W1').source === 'wish', '落库来源应为 wish', db.getUserSerial('W1').source);
 
-  // ② 第二次：扣 10
+  // ② 第二次：再扣 10
   const p = await claim(u11, '', 'req_wish_00002', envW);
   ok(p.json.ok && p.json.source === 'wish' && p.json.cost === 10, '第二次应扣愿望', p.json);
-  ok(db.getUserById(11).xpay_count === 15, '余额应从 25 扣到 15', db.getUserById(11).xpay_count);
-  ok(p.json.wish_left === 15, '接口应返回剩余愿望 15', p.json.wish_left);
+  ok(db.getUserById(11).xpay_count === 5, '余额应从 15 扣到 5', db.getUserById(11).xpay_count);
+  ok(p.json.wish_left === 5, '接口应返回剩余愿望 5', p.json.wish_left);
   ok(db.getUserSerial(p.json.serial).cost === 10, '落库应记录扣了 10 个愿望', db.getUserSerial(p.json.serial).cost);
 
   // ③ 幂等重放：不重复扣款、不重复发号
   const replay = await claim(u11, '', 'req_wish_00002', envW);
   ok(replay.json.ok && replay.json.repeated === true, '重放应返回上次结果', replay.json);
-  ok(db.getUserById(11).xpay_count === 15, '重放不应重复扣愿望', db.getUserById(11).xpay_count);
+  ok(db.getUserById(11).xpay_count === 5, '重放不应重复扣愿望', db.getUserById(11).xpay_count);
 
-  // ④ 第三次：15 → 5
-  const p2 = await claim(u11, '', 'req_wish_00003', envW);
-  ok(p2.json.ok && db.getUserById(11).xpay_count === 5, '再扣一次应剩 5', db.getUserById(11).xpay_count);
-
-  // ⑤ 余额不足（5 < 10）：不发号、不扣款
+  // ④ 余额不足（5 < 10）：不发号、不扣款
   const beforeCount = db.listUserSerials(11, 50, 0).length;
-  const p3 = await claim(u11, '', 'req_wish_00004', envW);
+  const p3 = await claim(u11, '', 'req_wish_00003', envW);
   ok(p3.json.ok === false && p3.json.error === 'need_wish', '余额不足应 need_wish', p3.json);
   ok(p3.json.need === 10 && p3.json.wish_left === 5, '应告知需要多少、现有多少', p3.json);
   ok(db.getUserById(11).xpay_count === 5, '余额不足不应扣款', db.getUserById(11).xpay_count);
@@ -913,6 +926,7 @@ let firstSerial = '';
 // ═══════════ 20. 下载/激活地址随序列号发放，只在「我的」可见 ═══════════
 {
   makeUser(17, 'openid-17', '13900000017');
+  db.putUser({ ...db.getUserById(17), xpay_count: 10 });
   kv.map.set('bt_list', ['LNK-S1|||||LNK-CAT', 'LNK-S2|||||LNK-CAT'].join('\n'));
   const envL = { ...aEnv, SERIAL_CATEGORY: 'LNK-CAT' };
   const u17 = userToken(17);
@@ -1096,6 +1110,7 @@ let firstSerial = '';
 // ═══════════ 23. 单条序列号详情（「我的」点开某条时按序列号精确取） ═══════════
 {
   makeUser(20, 'openid-20', '13900000020');
+  db.putUser({ ...db.getUserById(20), xpay_count: 20 });
   kv.map.set('bt_list', ['DT-S1|||||DT-CAT', 'DT-S2|||||DT-CAT'].join('\n'));
   const envD = { ...aEnv, SERIAL_CATEGORY: 'DT-CAT' };
   const u20 = userToken(20);
@@ -1155,6 +1170,7 @@ let firstSerial = '';
 // ═══════════ 24. 客户端删除（软删除）：只在本人隐藏，后台保留 ═══════════
 {
   makeUser(22, 'openid-22', '13900000022');
+  db.putUser({ ...db.getUserById(22), xpay_count: 20 });
   kv.map.set('bt_list', ['HD-S1|||||HD-CAT', 'HD-S2|||||HD-CAT', 'HD-S3|||||HD-CAT'].join('\n'));
   const envH = { ...aEnv, SERIAL_CATEGORY: 'HD-CAT' };
   const u22 = userToken(22);
@@ -1162,9 +1178,8 @@ let firstSerial = '';
   const c1 = await aCall('/api/serial/claim', {
     method: 'POST', token: u22, env: envH, body: { request_id: 'req_hd_00001' },
   });
-  ok(c1.json.ok && c1.json.source === 'free', '第一个应是首免', c1.json.source);
+  ok(c1.json.ok && c1.json.source === 'wish' && c1.json.cost === 10, '第一个应扣 10 愿望', c1.json);
   const hs1 = c1.json.serial;
-  db.putUser({ ...db.getUserById(22), xpay_count: 20 });
   const c2 = await aCall('/api/serial/claim', {
     method: 'POST', token: u22, env: envH, body: { request_id: 'req_hd_00002' },
   });
@@ -1195,15 +1210,14 @@ let firstSerial = '';
   const hide2 = await aCall('/api/serial/hide', { method: 'POST', token: u22, body: { serial: hs1 } });
   ok(hide2.json.ok && hide2.json.already === true, '重复删除应是幂等的', hide2.json);
 
-  // 免费额度不会因为删除而恢复（否则可以反复刷免费号）
-  ok(db.hasFreeSerial(22), '数据库里免费记录仍在，额度不恢复');
-  db.putUser({ ...db.getUserById(22), xpay_count: 0 });
+  // 客户端删除不影响愿望：删掉的号不退还愿望，也不能靠删除白嫖
+  ok(Number(db.getUserById(22).xpay_count) === 0, '删除记录不应退还愿望', db.getUserById(22).xpay_count);
   kv.map.set('bt_list', ['HD-S4|||||HD-CAT'].join('\n'));
   const againClaim = await aCall('/api/serial/claim', {
     method: 'POST', token: u22, env: envH, body: { request_id: 'req_hd_00003' },
   });
   ok(againClaim.json.ok === false && againClaim.json.error === 'need_wish',
-    '删除记录后不应恢复免费额度（仍按付费判定）', againClaim.json);
+    '删除记录后仍然要扣愿望（没有免费额度可刷）', againClaim.json);
 
   // 别人的记录删不掉
   makeUser(23, 'openid-23', '13900000023');
@@ -1246,6 +1260,328 @@ let firstSerial = '';
   const codesHtml = await codesAdmin.text();
   ok(codesHtml.includes(targetCode.code), '后台应仍能看到这条验证码', targetCode.code);
   ok(codesHtml.includes('用户已删除'), '验证码后台应标记「用户已删除」');
+}
+
+// ═══════════ 25. 邀请制：新用户赠礼 / 绑定邀请人 / 给邀请人发愿望 ═══════════
+{
+  // ① 新用户注册赠送 1 个愿望（默认配置）
+  makeUser(30, 'openid-30', '13800000030');   // makeUser 不走登录，new_gift=0
+  const g1 = await __db.grantNewUserGiftTx({ userId: 30, wish: 1 });
+  ok(g1.ok && g1.granted === true && g1.wish === 1, '新用户应拿到 1 个愿望', g1);
+  const g2 = await __db.grantNewUserGiftTx({ userId: 30, wish: 1 });
+  ok(g2.granted === false && g2.wish === 0, '新手礼包只能发一次', g2);
+  ok(Number(db.getUserById(30).xpay_count) === 1, '余额应为 1（不重复加）', db.getUserById(30).xpay_count);
+
+  // ② 1 个愿望不够取号（要 10 个）
+  kv.map.set('bt_list', ['INV-S1|||||INV-CAT'].join('\n'));
+  const envI = { ...aEnv, SERIAL_CATEGORY: 'INV-CAT' };
+  const poor = await claim(userToken(30), '', 'req_inv_00001', envI);
+  ok(poor.json.ok === false && poor.json.error === 'need_wish', '1 个愿望不够取号', poor.json);
+
+  // ③ 手机号是参与邀请的前提（不校验号段，但必须填）
+  makeUser(38, 'openid-38', '');          // 没填手机号
+  const noPhoneBind = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(38), body: { inviter_id: 31 },
+  });
+  ok(noPhoneBind.status === 400 && noPhoneBind.json.error === 'need_phone',
+    '没填手机号不能填写邀请人', noPhoneBind.json);
+
+  // 填上手机号（宽松：6~15 位数字都行）
+  const savePhone = await aCall('/api/user/phone', { method: 'POST', token: userToken(38), body: { phone: '138 0013 8000' } });
+  ok(savePhone.json.ok && savePhone.json.phone === '13800138000', '手机号应清洗成纯数字保存', savePhone.json);
+  const shortPhone = await aCall('/api/user/phone', { method: 'POST', token: userToken(38), body: { phone: '12345' } });
+  ok(shortPhone.status === 400 && shortPhone.json.error === 'bad_phone', '太短的号码应被拒', shortPhone.json);
+  const lenientPhone = await aCall('/api/user/phone', { method: 'POST', token: userToken(38), body: { phone: '0755-1234567' } });
+  ok(lenientPhone.json.ok && lenientPhone.json.phone === '07551234567', '固话这类号码也应接受（不校验号段）', lenientPhone.json);
+  await aCall('/api/user/phone', { method: 'POST', token: userToken(38), body: { phone: '13800138000' } });
+
+  // 邀请人自己没填手机号 → 也不能被邀请
+  makeUser(39, 'openid-39', '');          // 邀请人（无手机号）
+  makeUser(40, 'openid-40', '13900000040'); // 被邀请人（有手机号）
+  const inviterNoPhone = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(40), body: { inviter_id: 39 },
+  });
+  ok(inviterNoPhone.status === 400 && inviterNoPhone.json.error === 'inviter_need_phone',
+    '邀请人没填手机号时绑定应被拒', inviterNoPhone.json);
+
+  // ④ 填邀请人：给邀请人加 5 个愿望
+  makeUser(31, 'openid-31', '13800000031');   // 邀请人（有手机号）
+  makeUser(32, 'openid-32', '13800000032');   // 被邀请人（有手机号）
+  const before31 = Number(db.getUserById(31).xpay_count);
+  const bind = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(32), body: { inviter_id: 31 },
+  });
+  ok(bind.status === 200 && bind.json.ok && bind.json.wish === 5, '绑定成功应给邀请人发 5 个愿望', bind.json);
+  ok(Number(db.getUserById(31).xpay_count) === before31 + 5, '邀请人余额应 +5', db.getUserById(31).xpay_count);
+  ok(Number(db.getUserById(32).invited_by) === 31, '被邀请人应记下邀请人ID', db.getUserById(32).invited_by);
+
+  // 填完手机号后就能绑定了（绑给另一个有手机号的邀请人，避免影响后面的计数）
+  makeUser(41, 'openid-41', '13800000041');
+  const bindAfterPhone = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(38), body: { inviter_id: 41 },
+  });
+  ok(bindAfterPhone.json.ok, '填了手机号就能填邀请人', bindAfterPhone.json);
+  ok(Number(db.getUserById(41).xpay_count) === 5, '该邀请人也应拿到 5 个愿望', db.getUserById(41).xpay_count);
+
+  // ④ 不能重复绑定 / 不能填自己 / 不能填不存在的ID
+  const again = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(32), body: { inviter_id: 30 },
+  });
+  ok(again.status === 409 && again.json.error === 'already_bound', '不能重复绑定邀请人', again.json);
+
+  const self = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(30), body: { inviter_id: 30 },
+  });
+  ok(self.json.ok === false && self.json.error === 'self', '不能填自己', self.json);
+
+  makeUser(33, 'openid-33', '13800000033');
+  const ghost = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(33), body: { inviter_id: 99999 },
+  });
+  ok(ghost.json.ok === false && ghost.json.error === 'inviter_not_found', '邀请人不存在应报错', ghost.json);
+
+  const badId = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(33), body: { inviter_id: 'abc' },
+  });
+  ok(badId.status === 400 && badId.json.error === 'bad_inviter', '邀请人ID非数字应 400', badId.json);
+
+  // ⑤ 邀请多个 → 累加（邀请 2 个就是 10）
+  makeUser(34, 'openid-34', '13800000034');
+  const bind2 = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(34), body: { inviter_id: 31 },
+  });
+  ok(bind2.json.ok && Number(db.getUserById(31).xpay_count) === before31 + 10,
+    '邀请 2 个人应累计 10 个愿望', db.getUserById(31).xpay_count);
+
+  // ⑥ /api/referral/info：我的ID / 邀请人数 / 累计愿望 / 规则文案
+  const info = await aCall('/api/referral/info', { token: userToken(31) });
+  ok(info.json.ok && info.json.my_id === 31, '应返回我的用户ID', info.json);
+  ok(info.json.invited_count === 2 && info.json.wish_from_invite === 10,
+    '应返回邀请 2 人、累计 10 愿望', info.json);
+  ok(info.json.invite_wish === 5 && info.json.new_user_wish === 1, '应返回后台配置的奖励数', info.json);
+  ok(typeof info.json.intro === 'string' && info.json.intro.includes('5'),
+    '应返回邀请规则文案（含每邀请奖励数）', info.json.intro);
+  ok(info.json.can_bind === true, '还没填过邀请人时应允许填写', info.json.can_bind);
+
+  const info32 = await aCall('/api/referral/info', { token: userToken(32) });
+  ok(info32.json.can_bind === false && info32.json.invited_by === 31,
+    '填过邀请人后 can_bind 应为 false，并带出邀请人ID', info32.json);
+
+  // ⑦ 被邀请人自己能取的号仍然要愿望（不额外送）
+  ok(Number(db.getUserById(32).xpay_count || 0) === 0, '被邀请人不会额外得到愿望', db.getUserById(32).xpay_count);
+
+  // ⑧ /api/app/config 公开接口（不需要登录）
+  const cfg = await aCall('/api/app/config');
+  ok(cfg.status === 200 && cfg.json.ok, '配置接口应公开可用', cfg.status);
+  ok(cfg.json.new_user_wish === 1 && cfg.json.invite_wish === 5, '应返回赠送与邀请奖励', cfg.json);
+  ok(cfg.json.serial_cost === 10 && typeof cfg.json.serial_intro === 'string',
+    '应返回取号消耗与底部文案', { cost: cfg.json.serial_cost, intro: JSON.stringify(cfg.json.serial_intro).slice(0, 40) });
+
+  // ⑨ /api/user/me 带邀请摘要
+  const me31 = await aCall('/api/user/me', { token: userToken(31) });
+  ok(me31.json.referral && me31.json.referral.invited_count === 2
+    && me31.json.referral.wish_from_invite === 10, '/api/user/me 应带邀请摘要', me31.json.referral);
+
+  // ⑩ 后台把「邀请奖励」改成 0 → 之后绑定只记录、不发愿望
+  db.setSetting('invite_wish', '0');
+  makeUser(35, 'openid-35', '13800000035');
+  const zero = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(35), body: { inviter_id: 31 },
+  });
+  ok(zero.json.ok && zero.json.wish === 0, '奖励设为 0 时绑定成功但不发愿望', zero.json);
+  ok(Number(db.getUserById(31).xpay_count) === before31 + 10, '设为 0 后邀请人余额不再增加',
+    db.getUserById(31).xpay_count);
+  ok(db.countInvited(31) === 3, '仍然记录邀请关系', db.countInvited(31));
+
+  // ⑪ 新用户赠送改成 0 → 注册不再送
+  db.setSetting('new_user_wish', '0');
+  makeUser(36, 'openid-36', '');
+  const g0 = await __db.grantNewUserGiftTx({ userId: 36, wish: 0 });
+  ok(g0.granted === false, '配置为 0 时不发愿望', g0);
+  ok(Number(db.getUserById(36).xpay_count || 0) === 0, '余额仍为 0', db.getUserById(36).xpay_count);
+
+  // ⑫ 邀请超过时限（默认 7 天）后不能再绑定
+  db.setSetting('invite_wish', '5');
+  db.setSetting('new_user_wish', '1');
+  makeUser(37, 'openid-37', '13800000037');
+  // putUser 更新时不会改 created_at，这里直接改库把注册时间设成 30 天前
+  db.db.prepare('UPDATE users SET created_at = ? WHERE id = ?').run(nowSec() - 30 * 86400, 37);
+  const expired = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(37), body: { inviter_id: 31 },
+  });
+  ok(expired.json.ok === false && expired.json.error === 'window_expired',
+    '注册超过 7 天不能再填邀请人', expired.json);
+
+  // ⑬ 时限改成 0（不限）后又能绑
+  db.setSetting('invite_window_days', '0');
+  const ok0 = await aCall('/api/referral/bind', {
+    method: 'POST', token: userToken(37), body: { inviter_id: 31 },
+  });
+  ok(ok0.json.ok && ok0.json.wish === 5, '时限设为 0 后不限时间', ok0.json);
+
+  // 清理设置，避免影响后续用例
+  db.setSetting('invite_window_days', '');
+  db.setSetting('invite_wish', '');
+  db.setSetting('new_user_wish', '');
+}
+
+// ═══════════ 26. 后台取消邀请绑定（可同时收回愿望） ═══════════
+{
+  const adminPost = (path, body) => aWorker.fetch(new Request('https://api.test' + path, {
+    method: 'POST',
+    headers: { Cookie: 'admin_token=' + adminToken, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(body).toString(),
+  }), aEnv, {});
+
+  // 先造一对：邀请人 51，被邀请人 52
+  makeUser(51, 'openid-51', '13800000051');
+  makeUser(52, 'openid-52', '13800000052');
+  const bind = await aCall('/api/referral/bind', { method: 'POST', token: userToken(52), body: { inviter_id: 51 } });
+  ok(bind.json.ok, '准备数据：绑定成功', bind.json);
+  ok(Number(db.getUserById(51).xpay_count) === 5, '邀请人应有 5 个愿望', db.getUserById(51).xpay_count);
+
+  // ① 未登录不能取消
+  {
+    const r = await aWorker.fetch(new Request('https://api.test/admin/referral/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ invitee_id: '52', reclaim: '1' }).toString(),
+    }), aEnv, {});
+    ok(r.status === 302 && String(r.headers.get('location') || '').includes('/login'),
+      '未登录不能取消邀请绑定', r.status);
+    ok(db.countInvited(51) === 1, '未登录时数据不应变化', db.countInvited(51));
+  }
+
+  // ② 取消（不收回愿望）
+  {
+    const r = await adminPost('/admin/referral/cancel', { invitee_id: '52' });
+    const loc = decodeURIComponent(String(r.headers.get('location') || '').replace(/\+/g, ' '));
+    ok(r.status === 302 && /已取消邀请绑定/.test(loc), '取消应成功并提示', loc);
+    ok(db.countInvited(51) === 0, '邀请记录应被删除', db.countInvited(51));
+    ok(Number(db.getUserById(52).invited_by) === 0, '被邀请人应解除绑定', db.getUserById(52).invited_by);
+    ok(Number(db.getUserById(51).xpay_count) === 5, '不收回时邀请人余额不变', db.getUserById(51).xpay_count);
+
+    // 解绑后可以重新填写邀请人
+    const rebind = await aCall('/api/referral/bind', { method: 'POST', token: userToken(52), body: { inviter_id: 51 } });
+    ok(rebind.json.ok, '解绑后可以重新填写邀请人', rebind.json);
+    ok(Number(db.getUserById(51).xpay_count) === 10, '重新绑定会再发一次奖励', db.getUserById(51).xpay_count);
+  }
+
+  // ③ 取消并收回愿望
+  {
+    const r = await adminPost('/admin/referral/cancel', { invitee_id: '52', reclaim: '1' });
+    const loc = decodeURIComponent(String(r.headers.get('location') || '').replace(/\+/g, ' '));
+    ok(r.status === 302 && /收回 5 个愿望/.test(loc), '收回时应在提示里写明数量', loc);
+    ok(Number(db.getUserById(51).xpay_count) === 5, '收回后邀请人余额应减 5', db.getUserById(51).xpay_count);
+    ok(db.countInvited(51) === 0 && Number(db.getUserById(52).invited_by) === 0, '关系应被解除');
+  }
+
+  // ④ 余额不足时按现有余额收回，不扣成负数
+  {
+    const bind3 = await aCall('/api/referral/bind', { method: 'POST', token: userToken(52), body: { inviter_id: 51 } });
+    ok(bind3.json.ok, '准备数据：再绑一次', bind3.json);
+    db.putUser({ ...db.getUserById(51), xpay_count: 2 });
+    const r = await adminPost('/admin/referral/cancel', { invitee_id: '52', reclaim: '1' });
+    const loc = decodeURIComponent(String(r.headers.get('location') || '').replace(/\+/g, ' '));
+    ok(r.status === 302 && /收回 2 个愿望/.test(loc), '余额不足时按现有余额收回', loc);
+    ok(Number(db.getUserById(51).xpay_count) === 0, '不应扣成负数', db.getUserById(51).xpay_count);
+  }
+
+  // ⑤ 取消不存在的关系 → 提示而不是崩
+  {
+    const r = await adminPost('/admin/referral/cancel', { invitee_id: '52' });
+    const loc = decodeURIComponent(String(r.headers.get('location') || '').replace(/\+/g, ' '));
+    ok(r.status === 302 && /不存在/.test(loc), '取消不存在的关系应给出提示', loc);
+  }
+
+  // ⑥ 后台设置页应能看到「取消绑定」按钮
+  {
+    const page = await aWorker.fetch(new Request('https://api.test/admin/settings', {
+      headers: { Cookie: 'admin_token=' + adminToken },
+    }), aEnv, {});
+    const html = await page.text();
+    ok(page.status === 200 && /取消绑定/.test(html), '设置页应有取消绑定按钮');
+    ok(/收回愿望/.test(html), '设置页应有收回愿望选项');
+  }
+}
+
+// ═══════════ 27. 后台可以把消耗设成 0（免费） ═══════════
+{
+  const adminPost = (path, body) => aWorker.fetch(new Request('https://api.test' + path, {
+    method: 'POST',
+    headers: { Cookie: 'admin_token=' + adminToken, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(body).toString(),
+  }), aEnv, {});
+
+  // ① 后台保存「取号消耗 = 0」
+  {
+    const r = await adminPost('/admin/serials/settings', { cost: '0' });
+    const loc = decodeURIComponent(String(r.headers.get('location') || '').replace(/\+/g, ' '));
+    ok(r.status === 302 && /免费/.test(loc), '保存 0 应提示免费', loc);
+    ok(__db.getSetting('serial_wish_cost', '') === '0', '设置里应存 0', __db.getSetting('serial_wish_cost', ''));
+  }
+
+  // ② 没有愿望也能取号，且不扣愿望
+  {
+    makeUser(60, 'openid-60', '13800000060');
+    ok(Number(db.getUserById(60).xpay_count || 0) === 0, '准备数据：该用户 0 愿望');
+    kv.map.set('bt_list', ['FREE-S1|||||FREE-CAT', 'FREE-S2|||||FREE-CAT'].join('\n'));
+    const envF = { ...aEnv, SERIAL_CATEGORY: 'FREE-CAT' };
+    const r = await claim(userToken(60), '', 'req_free_0001', envF);
+    ok(r.json.ok && r.json.serial === 'FREE-S1', '消耗为 0 时应能免费取号', r.json);
+    ok(r.json.cost === 0 && r.json.source === 'wish', '返回的消耗应为 0', { cost: r.json.cost, source: r.json.source });
+    ok(Number(db.getUserById(60).xpay_count || 0) === 0, '免费取号不应扣愿望', db.getUserById(60).xpay_count);
+    ok(Number(db.getUserSerial('FREE-S1').cost) === 0, '落库应记录 cost=0', db.getUserSerial('FREE-S1').cost);
+
+    // /api/serial/mine 里的 cost 也应是 0
+    const m = await mine(userToken(60));
+    ok(m.json.cost === 0, '/api/serial/mine 应返回 cost=0', m.json.cost);
+
+    // /api/app/config 里的 serial_cost 也应是 0
+    const cfg = await aCall('/api/app/config');
+    ok(cfg.json.serial_cost === 0, '/api/app/config 应返回 serial_cost=0', cfg.json.serial_cost);
+  }
+
+  // ③ 后台保存「验证码消耗 = 0」，0 愿望也能生成
+  {
+    const r = await adminPost('/admin/codes/settings', { cost: '0' });
+    const loc = decodeURIComponent(String(r.headers.get('location') || '').replace(/\s+/g, ' ').replace(/\+/g, ' '));
+    ok(r.status === 302 && /免费/.test(loc), '保存验证码消耗 0 应提示免费', loc);
+    ok(socketCostProbe() === 0, 'socket 消耗应读到 0', socketCostProbe());
+
+    makeUser(61, 'openid-61', '13800000061');
+    const g = await aCall('/api/socket/codes', {
+      method: 'POST', token: userToken(61),
+      body: { macs: ['AABBCCDDEEFF', '001122334455'], request_id: 'req_free_sock1' },
+    });
+    ok(g.json.ok && g.json.items && g.json.items.length === 2, '消耗为 0 时应能免费生成验证码', g.json);
+    ok(Number(g.json.cost) === 0, '返回的消耗应为 0', g.json.cost);
+    ok(Number(db.getUserById(61).xpay_count || 0) === 0, '免费生成不应扣愿望', db.getUserById(61).xpay_count);
+  }
+
+  // ④ 非法值仍要拒绝
+  {
+    const r1 = await adminPost('/admin/serials/settings', { cost: '-1' });
+    const loc1 = decodeURIComponent(String(r1.headers.get('location') || '').replace(/\+/g, ' '));
+    ok(r1.status === 302 && /0-999/.test(loc1), '负数应被拒绝', loc1);
+
+    const r2 = await adminPost('/admin/codes/settings', { cost: '1000' });
+    const loc2 = decodeURIComponent(String(r2.headers.get('location') || '').replace(/\+/g, ' '));
+    ok(r2.status === 302 && /0-999/.test(loc2), '超过 999 应被拒绝', loc2);
+  }
+
+  // ⑤ 改回默认，避免影响别的用例
+  {
+    await adminPost('/admin/serials/settings', { cost: '10' });
+    await adminPost('/admin/codes/settings', { cost: '1' });
+    ok(socketCostProbe() === 1, '验证码消耗应恢复为 1', socketCostProbe());
+  }
+}
+
+/** 直接读 socket 单价（settings 表） */
+function socketCostProbe() {
+  const raw = __db.getSetting('socket_cost', '');
+  return raw === '' ? 1 : Number(raw);
 }
 
 // ═══════════ 结果 ═══════════
