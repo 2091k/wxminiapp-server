@@ -66,12 +66,12 @@ const ST = {
  * goodsPrice 必须与后台道具价格一致（单位：分），否则会报 -15010 / -15013。
  */
 const DEFAULT_PRODUCTS = [
-  { productId: 'svc_unlock_1',   name: '愿望1个',   goodsPrice: 100,   buyQuantity: 1, times: 1,   sort: 1 },
-  { productId: 'svc_unlock_5',   name: '愿望5个',   goodsPrice: 500,   buyQuantity: 1, times: 5,   sort: 2 },
-  { productId: 'svc_unlock_10',  name: '愿望10个',  goodsPrice: 1000,  buyQuantity: 1, times: 10,  sort: 3 },
-  { productId: 'svc_unlock_30',  name: '愿望30个',  goodsPrice: 3000,  buyQuantity: 1, times: 30,  sort: 4 },
-  { productId: 'svc_unlock_50',  name: '愿望50个',  goodsPrice: 5000,  buyQuantity: 1, times: 50,  sort: 5 },
-  { productId: 'svc_unlock_100', name: '愿望100个', goodsPrice: 10000, buyQuantity: 1, times: 100, sort: 6 }
+  { productId: 'svc_unlock_1',   name: '高级功能1次', goodsPrice: 100,   buyQuantity: 1, times: 1,   sort: 1 },
+  { productId: 'svc_unlock_5',   name: '高级功能1次', goodsPrice: 500,   buyQuantity: 1, times: 5,   sort: 2 },
+  { productId: 'svc_unlock_10',  name: '高级功能1次', goodsPrice: 1000,  buyQuantity: 1, times: 10,  sort: 3 },
+  { productId: 'svc_unlock_30',  name: '高级功能1次', goodsPrice: 3000,  buyQuantity: 1, times: 30,  sort: 4 },
+  { productId: 'svc_unlock_50',  name: '高级功能1次', goodsPrice: 5000,  buyQuantity: 1, times: 50,  sort: 5 },
+  { productId: 'svc_unlock_100', name: '高级功能1次', goodsPrice: 10000, buyQuantity: 1, times: 100, sort: 6 }
 ];
 
 export default {
@@ -119,6 +119,8 @@ async function route(request, env) {
   if (p === '/api/xpay/order'      && request.method === 'GET')  return apiQueryOrder(request, env, url);
   if (p === '/api/xpay/mock-pay'   && request.method === 'POST') return apiMockPay(request, env);
   if (p === '/api/xpay/notify'     && request.method === 'POST') return apiNotify(request, env);
+  // 微信「消息推送」接入验证（GET echostr）：虚拟支付的「发货推送」也走同一份配置
+  if (p === '/api/xpay/notify'     && request.method === 'GET')  return apiNotifyVerify(request, env, url);
   if (p === '/api/xpay/tasks'      && request.method === 'GET')  return apiTasks(request, env);
 
   if (p === adminPrefix || p === adminPrefix + '/')                        return adminIndex(request, env, url);
@@ -135,6 +137,7 @@ async function route(request, env) {
   }
   if (p === adminPrefix + '/api/stats'  && request.method === 'GET')       return adminApiStats(request, env);
   if (p === adminPrefix + '/api/orders' && request.method === 'GET')       return adminApiOrders(request, env, url);
+  if (p === adminPrefix + '/api/orders/redeliver' && request.method === 'POST') return adminApiOrderRedeliver(request, env);
   if (p === adminPrefix + '/api/export.csv' && request.method === 'GET')   return adminApiExportCsv(request, env, url);
   if (p === adminPrefix + '/settings/import-users' && request.method === 'POST') return adminImportUsers(request, env, url);
   if (p === adminPrefix + '/settings/import-table' && request.method === 'POST') return adminImportTable(request, env, url);
@@ -172,25 +175,103 @@ function html(body, status = 200, extraHeaders = {}) {
     headers: { 'content-type': 'text/html; charset=utf-8', ...extraHeaders },
   });
 }
+/** 后台统一「深色科技风」主题：各页 <style> 开头注入，提供变量与通用组件（卡片/表格/按钮/徽章/表单/提示/分页） */
+const DARK = `
+:root{
+  --bg:#0d1117; --panel:#161c24; --panel2:#1d2530; --line:#2a313c; --line2:#3a4351;
+  --fg:#e6edf3; --muted:#8b98a9; --brand:#38bdf8; --brand2:#1f6feb;
+  --header-bg:rgba(22,28,36,.85); --side-bg:#10151c;
+  --ok:#3fb950; --ok-bg:rgba(63,185,80,.15);
+  --warn:#d29922; --warn-bg:rgba(210,153,34,.15);
+  --err:#f85149; --err-bg:rgba(248,81,73,.15);
+  --info:#38bdf8; --info-bg:rgba(56,189,248,.15);
+  --purple:#a371f7; --purple-bg:rgba(163,113,247,.16);
+  --norm-bg:rgba(139,152,169,.16);
+  --shadow:0 1px 2px rgba(0,0,0,.3);
+}
+:root[data-theme=light]{
+  --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef1f5; --line:#e2e8f0; --line2:#cbd5e1;
+  --fg:#1f2937; --muted:#6b7280; --brand:#2563eb; --brand2:#2563eb;
+  --header-bg:rgba(255,255,255,.85); --side-bg:#ffffff;
+  --ok:#166534; --ok-bg:#dcfce7;
+  --warn:#92400e; --warn-bg:#fef3c7;
+  --err:#b91c1c; --err-bg:#fee2e2;
+  --info:#2563eb; --info-bg:#e0f2fe;
+  --purple:#7c3aed; --purple-bg:#ede9fe;
+  --norm-bg:#eef1f5;
+  --shadow:0 1px 2px rgba(15,23,42,.06);
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
+a{color:var(--brand);text-decoration:none}
+a:hover{text-decoration:underline}
+.muted{color:var(--muted);font-size:12px}
+.mono{font-family:Menlo,Consolas,monospace;font-size:12px;color:var(--muted)}
+.money{font-weight:600;color:var(--ok)}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px;box-shadow:var(--shadow)}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:13px;vertical-align:middle}
+th{background:var(--panel2);color:var(--muted);font-weight:500}
+tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:var(--panel2)}
+button{padding:9px 18px;background:var(--brand2);color:#fff;border:0;border-radius:8px;font-size:14px;cursor:pointer}
+button:hover{filter:brightness(1.12)}
+.tag{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;line-height:1.6}
+.tag.ok{background:var(--ok-bg);color:var(--ok)}
+.tag.ban{background:var(--err-bg);color:var(--err)}
+.tag.wait{background:var(--warn-bg);color:var(--warn)}
+.tag.normal{background:var(--norm-bg);color:var(--muted)}
+.tag.vip{background:var(--info-bg);color:var(--info)}
+.tag.diamond{background:var(--purple-bg);color:var(--purple)}
+.tag.mock{background:var(--warn-bg);color:var(--warn)}
+input,select,textarea{background:var(--panel2);border:1px solid var(--line2);color:var(--fg);border-radius:8px;padding:8px 10px;font-size:14px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--brand)}
+input[type=checkbox]{accent-color:var(--brand);cursor:pointer}
+::placeholder{color:var(--muted)}
+.hint{background:var(--info-bg);border:1px solid var(--info-bg);color:var(--info);padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.8;margin-bottom:14px}
+.hint code{background:rgba(127,127,127,.15);padding:1px 6px;border-radius:4px;font-family:Menlo,Consolas,monospace}
+.msg{background:var(--ok-bg);color:var(--ok);border:1px solid var(--ok-bg);padding:10px 14px;border-radius:10px;margin-bottom:12px;font-size:13px}
+.notice{background:var(--warn-bg);border:1px solid var(--warn-bg);color:var(--warn);padding:10px 14px;border-radius:10px;font-size:13px;margin-bottom:12px}
+.warn{background:var(--err-bg);border:1px solid var(--err-bg);color:var(--err);padding:10px 14px;border-radius:10px;font-size:13px;margin-bottom:12px}
+.danger-box{border-color:var(--err)!important;background:var(--err-bg)}
+.btn-danger{background:var(--err)!important}
+.pager{margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:flex-end;color:var(--muted);font-size:13px}
+.pager button,.pager a{padding:6px 12px;border:1px solid var(--line2);background:var(--panel2);color:var(--fg);border-radius:8px;cursor:pointer;text-decoration:none}
+`;
+
+/** 皮肤引导：各页 <head> 最前注入，读取本机 localStorage 皮肤并在首屏前设置 data-theme，避免刷新闪色 */
+const THEME_BOOT = `<script>(function(){try{var t=localStorage.getItem('admin-theme');if(t!=='light'&&t!=='dark')t='dark';document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();</script>`;
+
 function xml(body, status = 200) {
   return new Response(body, {
     status,
     headers: { 'content-type': 'application/xml; charset=utf-8' },
   });
 }
-/** 平台要求的发货成功应答 */
-function notifyOk() {
+/**
+ * 平台要求的发货成功应答
+ * @param {boolean} asJson 推送是 JSON 时必须回 JSON（官方要求格式与推送一致）
+ */
+function notifyOk(asJson) {
+  if (asJson) return json({ ErrCode: 0, ErrMsg: 'success' });
   return xml('<xml><ErrCode>0</ErrCode><ErrMsg><![CDATA[success]]></ErrMsg></xml>');
 }
 /** 发货失败应答（平台会重试，最多 15 次） */
-function notifyFail(msg) {
-  return xml(`<xml><ErrCode>1</ErrCode><ErrMsg><![CDATA[${String(msg || 'fail').slice(0, 100)}]]></ErrMsg></xml>`);
+function notifyFail(msg, asJson) {
+  const m = String(msg || 'fail').slice(0, 100);
+  if (asJson) return json({ ErrCode: 1, ErrMsg: m });
+  return xml(`<xml><ErrCode>1</ErrCode><ErrMsg><![CDATA[${m}]]></ErrMsg></xml>`);
 }
 
 function now() { return Math.floor(Date.now() / 1000); }
 function getClientIp(request) {
-  return request.headers.get('cf-connecting-ip') ||
-         request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || '';
+  // 自托管走 Nginx 反代：优先 X-Real-IP，其次 X-Forwarded-For 的第一段；
+  // cf-connecting-ip 是早期 Cloudflare 部署的遗留，留作最后兜底。
+  const raw = request.headers.get('x-real-ip') ||
+              request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+              request.headers.get('cf-connecting-ip') || '';
+  // 去掉 IPv6 映射前缀（::ffff:1.2.3.4 → 1.2.3.4）
+  return raw.replace(/^::ffff:/, '');
 }
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
@@ -273,6 +354,12 @@ async function hmacSha256Hex(keyStr, msg) {
   );
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
   return bytesToHex(sig);
+}
+
+/** 微信消息推送「URL 接入验证」用：sha1(字典序拼接 token/timestamp/nonce) */
+async function sha1Hex(msg) {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(msg));
+  return bytesToHex(buf);
 }
 
 /**
@@ -445,9 +532,11 @@ async function apiLogin(request, env) {
     const base = {
       openid, unionid: unionid || null, session_key,
       nickname: '', phone: '',
-      xpay_count: 0,          // 剩余可用次数
-      xpay_total: 0,          // 累计购买次数
-      xpay_spent: 0,          // 累计消费（分）
+      xpay_count: 0,          // 旧余额模型字段：已冻结，不再读写
+      xpay_total: 0,          // 同上
+      xpay_spent: 0,          // 累计实付（分）：会员等级只看这个
+      free_serial: 0,         // 剩余免费取号次数（邀请获得）
+      free_socket: 0,         // 剩余免费验证码次数
       status: 0, remark: '',
       last_login_at: ts, created_at: ts, updated_at: ts,
     };
@@ -466,17 +555,17 @@ async function apiLogin(request, env) {
     }
     if (!user) return json({ error: 'alloc_id_failed', message: '分配用户ID失败，请重试' }, 500);
 
-    // 新用户注册赠送愿望（数量后台可配，默认 1；0 = 不送）。new_gift 标记兜底，只发一次
-    const giftWish = newUserWish(env);
-    const gift = await __db.grantNewUserGiftTx({ userId: user.id, wish: giftWish });
-    user = await __db.getUserById(user.id);
-    if (gift.granted && gift.wish > 0) {
+    // 注册赠送免费取号次数（后台 settings.new_user_free_credit，默认 0 = 不送）
+    const giftCredit = intSetting('new_user_free_credit', 0, 0, 99);
+    if (giftCredit > 0) {
+      await __db.grantFreeCreditsTx({ userId: user.id, kind: 'serial', add: giftCredit, earned: 0 });
       await kvAddLog(env.BTSMKV, {
         userId: user.id, action: 'new_user_gift',
-        detail: `注册赠送 ${gift.wish} 个愿望`,
+        detail: `注册赠送 ${giftCredit} 次免费取号`,
         ip: getClientIp(request), nickname: user.nickname, openid: user.openid,
       });
     }
+    user = await __db.getUserById(user.id);
   } else {
     user.unionid = unionid || user.unionid;
     // session_key 必须最新：signature 签名要用它，过期会报 -15007
@@ -511,15 +600,17 @@ async function apiMe(request, env) {
   const earned = await __db.sumInviteWish(user.id);
   return json({
     user: publicUser(user),
-    socket_cost: socketCost(),
     serial_cost: serialCost(env),
-    // 邀请制摘要：我的ID、邀请人数、邀请所得愿望、每邀请 1 人的奖励、是否已填邀请人
+    socket_cost: socketCost(),
+    // 邀请摘要：我的ID、已邀请人数、两套免费门槛与各自剩余免费次数
     referral: {
       my_id: Number(user.id),
       invited_count: invited,
-      wish_from_invite: earned,
-      invite_wish: inviteWish(env),
-      new_user_wish: newUserWish(env),
+      free_serial: Number(user.free_serial || 0),
+      free_socket: Number(user.free_socket || 0),
+      serial_need: serialInviteNeed(),
+      socket_need: socketInviteNeed(),
+      free_max: inviteFreeMax(),
       invited_by: Number(user.invited_by || 0),
       can_bind: !Number(user.invited_by || 0),
     },
@@ -612,42 +703,57 @@ function b64ToBytes(b64) {
 
 // ───────────────────────── 小程序：虚拟支付 ─────────────────────────
 
-/** 权益状态：剩余次数 > 0 即为有效 */
+/**
+ * 会员身份：注册即「会员」，累计实付达标升 SVIP / SVIP+。
+ * 只看「累计实付金额」，与任何余额无关 —— 本模型没有余额。
+ */
 function vipInfo(u) {
-  const count = Number(u.xpay_count || 0);
-  const total = Number(u.xpay_total || 0);
   const spent = Number(u.xpay_spent || 0);
+  const t = membershipThresholds();
+  const level = spent >= t.v3 ? 3 : (spent >= t.v2 ? 2 : 1);
+  const names = { 1: 'VIP', 2: 'SVIP', 3: 'SVIP+' };
   return {
-    is_svip: count > 0,
-    count,                       // 剩余可用次数
-    total,                       // 累计购买次数
+    is_member: true,
+    is_svip: level >= 2,
+    level,
+    level_name: names[level] || 'VIP',
     spent_cents: spent,
     spent: toYuan(spent),
-    level: count <= 0 ? 0 : (count >= 30 ? 2 : 1),
-    level_name: count <= 0 ? '普通用户' : (count >= 30 ? '高级会员' : '会员'),
-    expire_text: ''              // 次数制永不过期，保留字段兼容前端
+    free_serial: Number(u.free_serial || 0),   // 剩余免费取号次数（邀请获得，不是货币）
+    free_socket: Number(u.free_socket || 0),   // 剩余免费验证码次数
+    expire_text: ''                            // 会员无到期时间，保留字段兼容前端
   };
 }
 
-/** GET /api/xpay/products */
+/**
+ * GET /api/xpay/products
+ * 返回：可用价格档位 + 当前取号/验证码使用的档位 + 我的免费次数 + 邀请门槛
+ */
 async function apiProducts(request, env) {
   const user = await authUser(request, env);
   const deny = needUser(user);
   if (deny) return deny;
 
-  const list = await kvGetProducts(env.BTSMKV);
+  const list = (await kvGetProducts(env.BTSMKV)).slice().sort((a, b) => (a.sort || 0) - (b.sort || 0));
+  const price = await goodsPricing();
   return json({
-    products: list
-      .slice()
-      .sort((a, b) => (a.sort || 0) - (b.sort || 0))
-      .map(p => ({
-        productId: p.productId,
-        name: p.name,
-        goodsPrice: Number(p.goodsPrice || 0),
-        price: toYuan(p.goodsPrice),
-        times: Number(p.times || 1)
-      })),
-    count: Number(user.xpay_count || 0),
+    tiers: list.map(p => ({
+      productId: p.productId,
+      name: p.name || '',
+      price_cents: Number(p.goodsPrice || 0),
+      price: toYuan(p.goodsPrice),
+    })),
+    serial: priceShape(price.serial),
+    socket: priceShape(price.socket),
+    free: {
+      serial: Number(user.free_serial || 0),
+      socket: Number(user.free_socket || 0),
+    },
+    invite: {
+      serial_need: serialInviteNeed(),
+      socket_need: socketInviteNeed(),
+      free_max: inviteFreeMax(),
+    },
     mock: isMock(env),
     // iOS 端需微信 ≥ 8.0.68，由前端校验
     ios_min_version: '8.0.68'
@@ -655,8 +761,11 @@ async function apiProducts(request, env) {
 }
 
 /**
- * POST /api/xpay/order  body: { product_id }
- * 返回 { order, signData, paySig, signature, mode, mock }
+ * POST /api/xpay/order
+ * body: { kind: 'serial' | 'socket', version?, download_url?, key_url?, macs?: [] }
+ *
+ * 直购：一次下单 = 一次具体服务。价格从后台选定的档位取（必须与 MP 后台道具一致），
+ * 支付成功后才在「发货推送」里真正发号 / 生成验证码，任何余额都不产生。
  */
 async function apiCreateOrder(request, env) {
   const user = await authUser(request, env);
@@ -666,9 +775,40 @@ async function apiCreateOrder(request, env) {
   let body;
   try { body = await request.json(); } catch { return json({ error: 'bad_json' }, 400); }
 
-  const list = await kvGetProducts(env.BTSMKV);
-  const product = list.find(p => p.productId === body.product_id);
-  if (!product) return json({ error: 'product_not_found', message: '商品不存在或已下架' }, 400);
+  const kind = String(body.kind || '').trim();
+  if (kind !== 'serial' && kind !== 'socket') {
+    return json({ error: 'bad_kind', message: '未知的购买类型' }, 400);
+  }
+
+  // ① 这次要发什么
+  let payload = {};
+  let buyQuantity = 1;
+  if (kind === 'serial') {
+    payload = {
+      category: serialCategory(env),
+      version: String(body.version || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 80),
+      download_url: cleanUrl(body.download_url),
+      key_url: cleanUrl(body.key_url),
+    };
+  } else {
+    const { valid, invalid } = parseMacInput(body.macs !== undefined ? body.macs : body.mac);
+    if (invalid.length) {
+      return json({ ok: false, error: 'bad_mac', message: 'MAC 地址格式不对：需要 12 位十六进制', invalid: invalid.slice(0, 10) }, 400);
+    }
+    if (!valid.length) return json({ ok: false, error: 'empty_mac', message: '请先输入设备 MAC 地址' }, 400);
+    if (valid.length > SOCKET_MAX_BATCH) {
+      return json({ ok: false, error: 'too_many', message: `一次最多生成 ${SOCKET_MAX_BATCH} 个，请分批`, max: SOCKET_MAX_BATCH }, 400);
+    }
+    payload = { macs: valid };
+    buyQuantity = valid.length;
+  }
+
+  // ② 价格档位
+  const price = await goodsPricing();
+  const tier = kind === 'serial' ? price.serial : price.socket;
+  if (!tier || !Number(tier.goodsPrice)) {
+    return json({ error: 'tier_not_configured', message: '后台没有可用的价格档位，请联系客服' }, 500);
+  }
 
   const ts = now();
   const outTradeNo = makeOutTradeNo();
@@ -679,14 +819,18 @@ async function apiCreateOrder(request, env) {
     outTradeNo,
     userId: Number(user.id),
     openid: user.openid,
-    productId: product.productId,
-    productName: product.name,
-    goodsPrice: Number(product.goodsPrice || 0),
-    buyQuantity: Number(product.buyQuantity || 1),
-    times: Number(product.times || 1),
+    kind,
+    payload: JSON.stringify(payload),
+    productId: tier.productId,
+    productName: tier.name || (kind === 'serial' ? '取号服务' : '插座验证码'),
+    goodsPrice: Number(tier.goodsPrice),
+    buyQuantity,
+    times: buyQuantity,
     status: ST.PENDING,
     wxOrderId: '',
     mock: isMock(env),
+    deliver_status: 'pending',
+    deliver_result: '',
     createdAt: ts,
     deliveredAt: 0
   };
@@ -726,7 +870,7 @@ async function apiCreateOrder(request, env) {
   await kvPutOrder(env.BTSMKV, order);
   await kvAddLog(env.BTSMKV, {
     userId: user.id, action: 'order_create',
-    detail: `${order.productName} ${toYuan(order.goodsPrice)}元 ${outTradeNo}`,
+    detail: `${kind} ${order.productName} ¥${toYuan(order.goodsPrice)}×${buyQuantity} ${outTradeNo}`,
     ip: getClientIp(request), nickname: user.nickname, openid: user.openid
   });
 
@@ -788,20 +932,88 @@ async function apiMockPay(request, env) {
   return json({ ok: true, order: publicOrder(order), vip: vipInfo(fresh || user) });
 }
 
-/** 解析发货推送 XML 的极简实现（平台推送结构固定，不做通用 XML 解析） */
+/**
+ * 解析发货推送 XML。
+ * 平台推送有两种常见形态，两种都要认：
+ *   ① 扁平 CDATA：<OutTradeNo><![CDATA[..]]></OutTradeNo>
+ *   ② 嵌套对象：<WeChatPayInfo><![CDATA[{"MchOrderNo":".."}]]></WeChatPayInfo>
+ *                <GoodsInfo><![CDATA[{"ProductId":"..","Quantity":1}]]></GoodsInfo>
+ */
 function parseNotifyXml(text) {
   const pick = (tag) => {
     const m = new RegExp('<' + tag + '>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</' + tag + '>').exec(text);
     return m ? m[1].trim() : '';
   };
+  // 子对象：既可能是 JSON 串，也可能是内嵌 XML，解析不出来就当空对象
+  const sub = (tag) => {
+    const v = pick(tag);
+    if (!v) return {};
+    try { const o = JSON.parse(v); return o && typeof o === 'object' ? o : {}; } catch { return {}; }
+  };
+  const wp = sub('WeChatPayInfo');
+  const gi = sub('GoodsInfo');
   return {
     event: pick('Event'),
     openid: pick('OpenId'),
     outTradeNo: pick('OutTradeNo'),
-    wxOrderId: pick('MchOrderNo'),        // 平台单号，位于 WeChatPayInfo.MchOrderNo
-    productId: pick('ProductId'),
-    quantity: Number(pick('Quantity') || 0)
+    wxOrderId: wp.MchOrderNo || pick('MchOrderNo'),
+    productId: gi.ProductId || pick('ProductId'),
+    quantity: Number(gi.Quantity || pick('Quantity') || 0)
   };
+}
+
+/**
+ * 解析 JSON 形态的推送（MP 后台「消息推送」数据格式可以选 JSON）。
+ * 结构与 XML 一一对应，只是嵌套成对象。
+ */
+function parseNotifyJson(text) {
+  let o;
+  try { o = JSON.parse(text); } catch { return {}; }
+  if (!o || typeof o !== 'object') return {};
+  const wp = o.WeChatPayInfo || {};
+  const gi = o.GoodsInfo || {};
+  return {
+    event: o.Event || '',
+    openid: o.OpenId || '',
+    outTradeNo: o.OutTradeNo || '',
+    wxOrderId: wp.MchOrderNo || '',
+    productId: gi.ProductId || '',
+    quantity: Number(gi.Quantity || 0)
+  };
+}
+
+/**
+ * GET /api/xpay/notify —— 微信「消息推送」URL 接入验证
+ *
+ * MP 后台【开发】-【开发管理】-【消息推送】点「提交/启用」时，微信会先 GET 一次：
+ *   ?signature=..&timestamp=..&nonce=..&echostr=..
+ * 校验：token、timestamp、nonce 三个参数按字典序排序后拼接，做 sha1，与 signature 比对；
+ * 通过后必须**原样返回 echostr**（纯文本），否则后台提示验证失败、配置存不下来。
+ * 虚拟支付的「发货推送」用的就是这份配置，所以这里的 Token 必须与 MP 后台令牌一致。
+ */
+async function apiNotifyVerify(request, env, url) {
+  const token = String(env.XPAY_NOTIFY_TOKEN || '');
+  const signature = url.searchParams.get('signature') || '';
+  const timestamp = url.searchParams.get('timestamp') || '';
+  const nonce = url.searchParams.get('nonce') || '';
+  const echostr = url.searchParams.get('echostr') || '';
+  const text = (body, status) => new Response(body, {
+    status, headers: { 'content-type': 'text/plain; charset=utf-8' },
+  });
+
+  if (!token) {
+    await kvAddLog(env.BTSMKV, { userId: 0, action: 'xpay_notify_verify_bad', detail: '未配置 XPAY_NOTIFY_TOKEN', ip: getClientIp(request) });
+    return text('notify token not configured', 503);
+  }
+  if (!signature || !echostr) return text('missing params', 400);
+
+  const expect = await sha1Hex([token, timestamp, nonce].sort().join(''));
+  if (!safeEqual(expect, signature)) {
+    await kvAddLog(env.BTSMKV, { userId: 0, action: 'xpay_notify_verify_bad', detail: 'signature 不匹配', ip: getClientIp(request) });
+    return text('bad signature', 403);
+  }
+  await kvAddLog(env.BTSMKV, { userId: 0, action: 'xpay_notify_verify_ok', detail: '消息推送 URL 验证通过', ip: getClientIp(request) });
+  return text(echostr, 200);
 }
 
 /**
@@ -809,10 +1021,13 @@ function parseNotifyXml(text) {
  *
  * 平台会重试最多 15 次，所以：
  *   - 用平台单号 wxOrderId 做幂等去重，重复通知只发一次货
- *   - 发货成功必须返回 <ErrCode>0</ErrCode>，否则平台认为失败会一直重试
+ *   - 发货成功必须返回 ErrCode=0，且**应答格式要与推送一致**（XML 推 XML、JSON 推 JSON）
  */
 async function apiNotify(request, env) {
   const raw = await request.text();
+  // 按报文形态判断：以 { 开头或 content-type 含 json 就按 JSON 处理
+  const ctype = String(request.headers.get('content-type') || '').toLowerCase();
+  const asJson = /^\s*\{/.test(raw) || ctype.includes('json');
 
   // 可选签名校验：AppKey 与消息推送的 Token/AESKey 不是同一套，
   // 这里用 XPAY_APP_KEY 对原始报文做完整性校验（若配置了 XPAY_NOTIFY_SIGN_KEY 则用它）
@@ -822,17 +1037,20 @@ async function apiNotify(request, env) {
     const expect = await hmacSha256Hex(signKey, raw);
     if (!safeEqual(expect, gotSig)) {
       await kvAddLog(env.BTSMKV, { userId: 0, action: 'xpay_notify_bad_sign', detail: '签名不匹配', ip: getClientIp(request) });
-      return notifyFail('bad signature');
+      return notifyFail('bad signature', asJson);
     }
   }
 
-  const data = parseNotifyXml(raw);
+  const data = asJson ? parseNotifyJson(raw) : parseNotifyXml(raw);
   if (data.event && data.event !== 'xpay_goods_deliver_notify') {
-    return notifyOk(); // 其他事件直接忽略，避免平台重试
+    return notifyOk(asJson); // 其他事件直接忽略，避免平台重试
   }
   if (!data.outTradeNo && !data.wxOrderId) {
-    await kvAddLog(env.BTSMKV, { userId: 0, action: 'xpay_notify_malformed', detail: raw.slice(0, 300), ip: getClientIp(request) });
-    return notifyFail('malformed');
+    await kvAddLog(env.BTSMKV, {
+      userId: 0, action: 'xpay_notify_malformed',
+      detail: `fmt=${asJson ? 'json' : 'xml'} ${raw.slice(0, 300)}`, ip: getClientIp(request),
+    });
+    return notifyFail('malformed', asJson);
   }
 
   // 幂等：优先用平台单号反查（SQLite 直接查订单表）
@@ -845,10 +1063,10 @@ async function apiNotify(request, env) {
       detail: `outTradeNo=${data.outTradeNo} wxOrderId=${data.wxOrderId}`, ip: getClientIp(request)
     });
     // 订单找不到也返回成功，避免平台无意义重试；改用 tasks 兜底排查
-    return notifyOk();
+    return notifyOk(asJson);
   }
 
-  if (order.status === ST.DELIVERED) return notifyOk();   // 幂等：已发货
+  if (order.status === ST.DELIVERED) return notifyOk(asJson);   // 幂等：已发货
 
   // 校验金额/商品是否与本地订单一致，防篡改
   if (data.productId && data.productId !== order.productId) {
@@ -856,17 +1074,88 @@ async function apiNotify(request, env) {
       userId: order.userId, action: 'xpay_product_mismatch',
       detail: `notify=${data.productId} local=${order.productId}`, openid: order.openid
     });
-    return notifyFail('product mismatch');
+    return notifyFail('product mismatch', asJson);
   }
 
   order.wxOrderId = data.wxOrderId || order.wxOrderId;
   await deliverOrder(env, order, data.quantity || order.buyQuantity);
-  return notifyOk();
+  return notifyOk(asJson);
+}
+
+function safeJson(s) {
+  try { return JSON.parse(s || '{}') || {}; } catch { return {}; }
+}
+
+/** 付费取号发货：调序列号后台发号 → 落库。request_id = outTradeNo，天然幂等 */
+async function deliverSerial(env, order, user) {
+  const p = safeJson(order.payload);
+  const requestId = String(order.outTradeNo);
+  const category = String(p.category || serialCategory(env));
+
+  const existed = await __db.getUserSerialByRequestId(requestId);
+  if (existed) return { ok: true, serial: existed.serial };
+
+  const r = await btkeyRequest(env, '/api/claim', {
+    method: 'POST',
+    body: { category, request_id: requestId, exclude: [] },
+  });
+  const data = r.data || {};
+  if (!data.ok || !data.serial) {
+    return { ok: false, error: data.error || r.error || 'out_of_stock' };
+  }
+
+  const serial = String(data.serial);
+  const tx = await __db.claimSerialTx({
+    userId: user.id, credit: 0, cost: Number(order.goodsPrice || 0),
+    row: {
+      user_id: user.id, openid: user.openid, serial, category,
+      version: p.version || '',
+      download_url: p.download_url || '', key_url: p.key_url || '',
+      source: 'paid', cost: Number(order.goodsPrice || 0), request_id: requestId,
+      status: 'issued', claimed_at: now(), synced_at: 0,
+    },
+  });
+  if (!tx.ok) {
+    if (tx.error === 'duplicate_request') {
+      const dup = await __db.getUserSerialByRequestId(requestId);
+      if (dup) return { ok: true, serial: dup.serial };
+    }
+    // 落库失败：把号还回池子，订单标记发货失败，等补偿重试
+    try { await btkeyRequest(env, '/api/release', { method: 'POST', body: { serial, request_id: requestId } }); } catch {}
+    return { ok: false, error: tx.error };
+  }
+  try { await btkeyRequest(env, '/api/confirm', { method: 'POST', body: { serial, request_id: requestId } }); } catch {}
+  return { ok: true, serial };
+}
+
+/** 付费验证码发货：按订单里的 MAC 列表生成码。request_id = outTradeNo，天然幂等 */
+async function deliverSocket(env, order, user) {
+  const p = safeJson(order.payload);
+  const macs = Array.isArray(p.macs) ? p.macs : [];
+  const requestId = String(order.outTradeNo);
+
+  const old = await __db.listCodesByRequest(requestId);
+  if (old && old.length) return { ok: true, codes: old.map((r) => ({ mac: r.mac, code: r.code })) };
+  if (!macs.length) return { ok: false, error: 'empty_mac' };
+
+  const rows = macs.map((mac) => ({ mac, code: socketCodeOf(mac), kind: 'socket', openid: user.openid }));
+  const tx = await __db.createCodeBatchTx({
+    userId: user.id, requestId, credit: 0, cost: Number(order.goodsPrice || 0), rows,
+  });
+  if (!tx.ok) {
+    if (tx.error === 'duplicate_request') {
+      const dup = await __db.listCodesByRequest(requestId);
+      if (dup && dup.length) return { ok: true, codes: dup.map((r) => ({ mac: r.mac, code: r.code })) };
+    }
+    return { ok: false, error: tx.error };
+  }
+  return { ok: true, codes: rows.map((r) => ({ mac: r.mac, code: r.code })) };
 }
 
 /**
- * 发货：给用户加次数（幂等由调用方保证 status 检查）
- * @param {number} [quantity] 平台回传的购买数量，用于校验
+ * 发货：支付成功后才调用。按订单类型直接发结果，不产生任何余额。
+ * 发号失败 → 订单标记 paid_no_goods + deliver_status=failed，由 tasks/后台重试补发。
+ * @param {number} [quantity] 平台回传的购买数量
  */
 async function deliverOrder(env, order, quantity) {
   if (order.status === ST.DELIVERED) return order;
@@ -874,28 +1163,69 @@ async function deliverOrder(env, order, quantity) {
   const user = await kvGetUserById(env.BTSMKV, order.userId);
   if (!user) {
     order.status = ST.PAID_NO_GOODS;
+    order.deliver_status = 'failed';
     order.note = 'user not found';
     await kvPutOrder(env.BTSMKV, order);
     return order;
   }
 
-  // 按购买数量 × 单件次数发货
-  const qty = Number(quantity || order.buyQuantity || 1);
-  const times = Number(order.times || 1) * (qty > 0 ? qty : 1);
+  const qty = Math.max(1, Number(quantity || order.buyQuantity || 1));
+  let result = null;
 
-  user.xpay_count = Number(user.xpay_count || 0) + times;
-  user.xpay_total = Number(user.xpay_total || 0) + times;
-  user.xpay_spent = Number(user.xpay_spent || 0) + Number(order.goodsPrice || 0) * (qty > 0 ? qty : 1);
+  if (order.kind === 'serial') {
+    const r = await deliverSerial(env, order, user);
+    if (!r.ok) {
+      order.status = ST.PAID_NO_GOODS;
+      order.deliver_status = 'failed';
+      order.note = String(r.error || 'deliver_failed').slice(0, 100);
+      await kvPutOrder(env.BTSMKV, order);
+      await kvAddLog(env.BTSMKV, {
+        userId: user.id, action: 'xpay_deliver_failed',
+        detail: `${order.outTradeNo} ${order.note}`, openid: user.openid,
+      });
+      return order;
+    }
+    result = { serial: r.serial };
+  } else if (order.kind === 'socket') {
+    const r = await deliverSocket(env, order, user);
+    if (!r.ok) {
+      order.status = ST.PAID_NO_GOODS;
+      order.deliver_status = 'failed';
+      order.note = String(r.error || 'deliver_failed').slice(0, 100);
+      await kvPutOrder(env.BTSMKV, order);
+      await kvAddLog(env.BTSMKV, {
+        userId: user.id, action: 'xpay_deliver_failed',
+        detail: `${order.outTradeNo} ${order.note}`, openid: user.openid,
+      });
+      return order;
+    }
+    result = { codes: r.codes };
+  } else {
+    // 历史「愿望」订单：旧模型已下线，无法发货，留档人工处理
+    order.status = ST.PAID_NO_GOODS;
+    order.deliver_status = 'failed';
+    order.note = 'legacy_wish_order';
+    await kvPutOrder(env.BTSMKV, order);
+    return order;
+  }
+
+  // 累计实付（会员等级只看这个，与余额无关）
+  user.xpay_spent = Number(user.xpay_spent || 0) + Number(order.goodsPrice || 0) * qty;
   user.updated_at = now();
   await kvPutUser(env.BTSMKV, user);
 
   order.status = ST.DELIVERED;
+  order.deliver_status = 'issued';
+  order.deliver_result = JSON.stringify(result).slice(0, 300);
   order.deliveredAt = now();
   await kvPutOrder(env.BTSMKV, order);
 
+  const brief = order.kind === 'serial'
+    ? (result.serial || '')
+    : `${(result.codes || []).length} 个码`;
   await kvAddLog(env.BTSMKV, {
     userId: user.id, action: 'xpay_deliver',
-    detail: `${order.productName} +${times}次 剩余=${user.xpay_count} ${order.mock ? '(mock)' : order.wxOrderId}`,
+    detail: `${order.kind} ¥${toYuan(order.goodsPrice)}×${qty} ${brief} 累计¥${toYuan(user.xpay_spent)} ${order.mock ? '(mock)' : order.wxOrderId}`,
     nickname: user.nickname, openid: user.openid
   });
   return order;
@@ -991,13 +1321,19 @@ async function queryOrderRemote(env, order) {
 }
 
 function publicOrder(o) {
+  let result = null;
+  try { result = o.deliver_result ? JSON.parse(o.deliver_result) : null; } catch { result = null; }
   return {
     id: o.id,
+    kind: o.kind || '',
     productId: o.productId,
     productName: o.productName,
     price: toYuan(o.goodsPrice),
-    times: Number(o.times || 1) * Number(o.buyQuantity || 1),
+    quantity: Number(o.buyQuantity || 1),
     status: o.status,
+    deliver_status: o.deliver_status || '',
+    result,                                  // { serial } 或 { codes: [{mac, code}] }
+    note: o.note || '',                      // 发货失败原因（给前端提示用）
     mock: !!o.mock,
     createdAt: Number(o.createdAt || 0),
     deliveredAt: Number(o.deliveredAt || 0)
@@ -1014,8 +1350,8 @@ function publicUser(u) {
     is_svip: vip.is_svip,
     svip_level: vip.level,
     level_name: vip.level_name,
-    count: vip.count,
-    total: vip.total,
+    free_serial: vip.free_serial,
+    free_socket: vip.free_socket,
     spent_cents: vip.spent_cents,
     spent: vip.spent,
     expire_text: vip.expire_text,
@@ -1047,42 +1383,137 @@ function serialCategory(env) {
   return fromEnv || DEFAULT_SERIAL_CATEGORY;
 }
 
-/** 取号每次消耗：优先后台设置 settings.serial_wish_cost，其次 env.SERIAL_WISH_COST，默认 10 */
-const DEFAULT_WISH_COST = 10;
-const DEFAULT_SOCKET_COST = 1;
+// ───────────── 直购价格 / 邀请门槛 / 会员等级（后台可改，不用重启） ─────────────
+/*
+ * 直购模型：没有「愿望余额」。每次取号、每批验证码都直接付一次款，付完立刻发结果。
+ *
+ * 价格只能从「道具配置」表的档位里选 —— 档位必须与 MP 后台【虚拟支付 → 道具管理】
+ * 里登记的道具 ID 和价格完全一致，否则支付会报 -15013。所以后台改的是「用哪一档」。
+ *
+ * settings 键：
+ *   serial_tier        取号用哪个道具档位（默认 svc_unlock_10 = 10 元/次）
+ *   socket_tier        验证码用哪个道具档位（默认 svc_unlock_1 = 1 元/个）
+ *   serial_invite_need 邀请几人送 1 次免费取号（默认 2；0 = 关闭邀请免费）
+ *   socket_invite_need 邀请几人送 1 次免费验证码（默认 0 = 关闭）
+ *   invite_free_max    免费次数最多累计送几次（0 = 不限）
+ *   svip1_spent        累计实付满多少元升 SVIP（默认 100）
+ *   svip2_spent        累计实付满多少元升 SVIP+（默认 300）
+ */
+const DEFAULT_SERIAL_INVITE_NEED = 2;
+const DEFAULT_SOCKET_INVITE_NEED = 0;
+const DEFAULT_SERIAL_TIER = 'svc_unlock_10';
+const DEFAULT_SOCKET_TIER = 'svc_unlock_1';
 
-function readPositiveInt(raw, def) {
+/** 读整数设置：空串/非法/越界都回落默认值 */
+function intSetting(key, def, min = 0, max = 1000000) {
+  const raw = __db.getSetting(key, '');
+  if (raw === '') return def;
   const n = Math.floor(Number(raw));
-  return Number.isInteger(n) && n > 0 ? n : def;
+  if (!Number.isInteger(n) || n < min || n > max) return def;
+  return n;
+}
+
+function serialInviteNeed() { return intSetting('serial_invite_need', DEFAULT_SERIAL_INVITE_NEED, 0, 999); }
+function socketInviteNeed() { return intSetting('socket_invite_need', DEFAULT_SOCKET_INVITE_NEED, 0, 999); }
+/** 免费次数累计上限：0 = 不限 */
+function inviteFreeMax() { return intSetting('invite_free_max', 0, 0, 999); }
+
+function serialTierId() { return settingText('serial_tier', DEFAULT_SERIAL_TIER); }
+function socketTierId() { return settingText('socket_tier', DEFAULT_SOCKET_TIER); }
+
+// ── 客服入口开关（后台「系统设置 → 客服」）──
+//   总开关关掉 = 所有人都看不到；否则按身份分别控制：未登录 / VIP（1 级）/ SVIP（2 级以上）
+function boolSetting(key, def) {
+  const v = String(__db.getSetting(key, '') || '').trim();
+  if (v === '0') return 0;
+  if (v === '1') return 1;
+  return def;
+}
+function csEnabled() { return boolSetting('cs_enabled', 1); }
+function csGuest() { return boolSetting('cs_guest', 0); }   // 默认未登录不给入口
+function csVip() { return boolSetting('cs_vip', 1); }
+function csSvip() { return boolSetting('cs_svip', 1); }
+
+/** 一次取全客服配置（给 /api/app/config 用） */
+function csConfig() {
+  return { enabled: csEnabled(), guest: csGuest(), vip: csVip(), svip: csSvip() };
+}
+
+/** 会员等级门槛（单位：分）。注册即「会员」，累计实付达标升 SVIP / SVIP+ */
+function membershipThresholds() {
+  const y1 = intSetting('svip1_spent', 100, 0, 1000000);
+  const y2 = Math.max(y1, intSetting('svip2_spent', 300, 0, 1000000));
+  return { v2: y1 * 100, v3: y2 * 100 };
+}
+
+/** 按 productId 取价格档位；取不到就用兜底下标（避免下单直接 500） */
+async function tierOf(productId, fallbackIdx) {
+  const list = await kvGetProducts(null);
+  const hit = list.find((p) => p.productId === productId);
+  if (hit) return hit;
+  return Number.isInteger(fallbackIdx) ? (list[fallbackIdx] || null) : null;
+}
+
+/** 当前生效的两个商品：取号 / 验证码 */
+async function goodsPricing() {
+  return {
+    serial: await tierOf(serialTierId(), 2),
+    socket: await tierOf(socketTierId(), 0),
+  };
+}
+
+/** 开启/关闭下拉 */
+function optOnOff(v) {
+  const on = Number(v) === 1;
+  return `<option value="1"${on ? ' selected' : ''}>开启</option>`
+    + `<option value="0"${on ? '' : ' selected'}>关闭</option>`;
 }
 
 /**
- * 消耗愿望数：允许 0（0 = 不消耗愿望，免费）。
- * 空串 / 非法值才回落到默认值。
+ * 价格档位下拉选项。档位来自「道具配置」表，productId 与价格必须与 MP 后台【道具管理】一致，
+ * 否则支付会报 -15010 / -15013。
  */
-function readCostInt(raw, def) {
-  if (raw === '' || raw === null || raw === undefined) return def;
-  const n = Math.floor(Number(raw));
-  return Number.isInteger(n) && n >= 0 ? n : def;
+function tierOptionsHtml(list, selected) {
+  const rows = (list || []).map((p) =>
+    `<option value="${escapeHtml(p.productId)}"${p.productId === selected ? ' selected' : ''}>` +
+    `${escapeHtml(p.name || p.productId)} · ${toYuan(p.goodsPrice)} 元/次</option>`
+  ).join('');
+  return rows || '<option value="">（道具配置为空，请先添加档位）</option>';
 }
 
-function serialCost(env) {
-  // ① 后台「序列号发放」页面可配置；② 环境变量兜底；③ 内置默认
-  const dbVal = __db.getSetting('serial_wish_cost', '');
-  if (dbVal !== '') return readCostInt(dbVal, DEFAULT_WISH_COST);
-  if (env && env.SERIAL_WISH_COST !== undefined && env.SERIAL_WISH_COST !== '') {
-    return readCostInt(env.SERIAL_WISH_COST, DEFAULT_WISH_COST);
+/** 余额模型已废弃：保留同签名函数只为避免漏改的调用点直接崩，值恒为 0 */
+function serialCost() { return 0; }
+function socketCost() { return 0; }
+function wishCost() { return 0; }
+
+/**
+ * 按邀请门槛给邀请人补发免费次数（幂等）。
+ *   应发 = floor(已邀请人数 / 门槛)，只补「应发 - 已发放」的差额，重复调用不会多发。
+ *   门槛为 0 = 该功能不开启邀请免费；invite_free_max > 0 时限制最多累计送几次。
+ * @returns {Promise<{serial:number, socket:number}>} 本次各补发了几次
+ */
+async function grantInviteCredits(inviterId) {
+  const invited = await __db.countInvited(inviterId);
+  const inviter = await __db.getUserById(inviterId);
+  const out = { serial: 0, socket: 0 };
+  if (!inviter) return out;
+
+  const cap = inviteFreeMax();
+  const pairs = [
+    ['serial', serialInviteNeed(), Number(inviter.serial_earned || 0)],
+    ['socket', socketInviteNeed(), Number(inviter.socket_earned || 0)],
+  ];
+  for (const [kind, need, earned] of pairs) {
+    if (!need || need <= 0) continue;
+    let should = Math.floor(invited / need);
+    if (cap > 0) should = Math.min(should, cap);
+    if (should <= earned) continue;
+    const add = should - earned;
+    await __db.grantFreeCreditsTx({ userId: inviterId, kind, add, earned: should });
+    out[kind] = add;
   }
-  return DEFAULT_WISH_COST;
+  return out;
 }
-
-/** 单个验证码消耗：优先后台「智能插座验证码」页面设置 settings.socket_cost，默认 1；0 = 免费 */
-function socketCost() {
-  return readCostInt(__db.getSetting('socket_cost', ''), DEFAULT_SOCKET_COST);
-}
-
-// 旧调用名保留
-function wishCost(env) { return serialCost(env); }
 
 // ───────────────────────── 邀请制配置（后台可改） ─────────────────────────
 /*
@@ -1128,23 +1559,33 @@ function settingText(key, def) {
 
 /** 内置默认文案（后台没填时用） */
 function defaultInviteIntro(env) {
-  const per = inviteWish(env);
-  const gift = newUserWish(env);
-  const lines = [
-    `新用户注册即送 ${gift} 个愿望。`,
-    per > 0
-      ? `每邀请 1 个新用户，你得 ${per} 个愿望；邀请 2 个就是 ${per * 2} 个。`
-      : '当前后台未开启邀请奖励（邀请好友不会获得愿望）。',
-    `取号每次消耗 ${serialCost(env)} 个愿望，插座验证码每个 ${socketCost()} 个愿望。`,
+  const sn = serialInviteNeed();
+  const kn = socketInviteNeed();
+  return [
+    '注册即享 VIP 身份，累计消费可升级 SVIP。',
+    sn > 0 ? `每邀请 ${sn} 个新用户，送你 1 次免费取号。` : '当前未开启「邀请送免费取号」。',
+    kn > 0 ? `每邀请 ${kn} 个新用户，送你 1 次免费验证码。` : '当前未开启「邀请送免费验证码」。',
+    '取号与验证码都按次购买，支付成功后立即发放，按需付费、不充值、不留余额。',
     '被邀请人首次填写你的用户ID，即视为你邀请了他；每个账号只能填写一次邀请人，填了不能改。',
-  ];
-  return lines.join('\n');
+  ].join('\n');
 }
 
 function defaultSerialIntro(env) {
-  return `每次取号消耗 ${serialCost(env)} 个愿望（不提供免费额度）。`
-    + `愿望可以通过购买获得，也可以邀请好友：每邀请 1 个新用户送 ${inviteWish(env)} 个愿望。`
+  const sn = serialInviteNeed();
+  return '取号按次购买：每次支付页面上显示的金额，支付成功后立即发放序列号。'
+    + (sn > 0 ? `邀请 ${sn} 位新用户可免费取号 1 次。` : '')
     + '「我的 → 邀请好友」里可以填写邀请人ID、查看自己的邀请情况。';
+}
+
+/** 「购买须知」默认文案（后台可整套覆盖） */
+function defaultPurchaseNotice(env) {
+  return [
+    '1. 按次购买：每一次支付对应一次具体服务，支付成功后立即发放。',
+    '2. 序列号取号、插座验证码均为按次购买，价格以下单页面显示为准。',
+    '3. 注册即为 VIP，累计消费满额自动升级，具体等级以页面显示为准。',
+    '4. 邀请好友可获得免费次数，规则以「邀请好友」页显示为准。',
+    '5. 支付成功后如未收到结果，请在「我的」中查看或联系客服补发；退款请通过客服按平台规则申请。',
+  ].join('\n');
 }
 
 // ───────────────────────── 邀请制接口 ─────────────────────────
@@ -1154,16 +1595,31 @@ function defaultSerialIntro(env) {
  * 小程序首屏/邀请页要用到的配置与文案，全部来自后台设置
  */
 async function apiAppConfig(env) {
+  const price = await goodsPricing();
   return json({
     ok: true,
-    new_user_wish: newUserWish(env),
-    invite_wish: inviteWish(env),
     invite_window_days: inviteWindowDays(),
-    serial_cost: serialCost(env),
-    socket_cost: socketCost(),
+    serial: priceShape(price.serial),
+    socket: priceShape(price.socket),
+    serial_invite_need: serialInviteNeed(),
+    socket_invite_need: socketInviteNeed(),
+    invite_free_max: inviteFreeMax(),
     invite_intro: settingText('invite_intro', defaultInviteIntro(env)),
     serial_intro: settingText('serial_intro', defaultSerialIntro(env)),
+    purchase_notice: settingText('purchase_notice', defaultPurchaseNotice(env)),
+    cs: csConfig(),
   });
+}
+
+/** 价格档位对外形态（价格单位：分；price 是给人看的「元」） */
+function priceShape(t) {
+  if (!t) return { productId: '', name: '', price_cents: 0, price: '0.00' };
+  return {
+    productId: t.productId,
+    name: t.name || '',
+    price_cents: Number(t.goodsPrice || 0),
+    price: toYuan(t.goodsPrice),
+  };
 }
 
 /** GET /api/referral/info —— 我的ID / 已邀请人数 / 邀请所得愿望 / 是否已绑定邀请人 */
@@ -1191,15 +1647,19 @@ async function apiReferralInfo(request, env) {
     if (now() > bindDeadline) { canBind = false; reason = 'window_expired'; }
   }
 
+  const needS = serialInviteNeed();
+  const needK = socketInviteNeed();
   return json({
     ok: true,
     my_id: Number(user.id),
     nickname: user.nickname || '',
-    wish_left: Number(user.xpay_count || 0),
+    free_serial: Number(user.free_serial || 0),
+    free_socket: Number(user.free_socket || 0),
     invited_count: invited,
-    wish_from_invite: earned,
-    invite_wish: per,
-    new_user_wish: newUserWish(env),
+    serial_need: needS,
+    socket_need: needK,
+    serial_to_next: needS > 0 ? (needS - (invited % needS)) % needS : 0,
+    socket_to_next: needK > 0 ? (needK - (invited % needK)) % needK : 0,
     invite_window_days: days,
     invited_by: Number((bound && bound.inviter_id) || user.invited_by || 0),
     // 手机号是参与邀请的前提（不做短信校验，只要求填真实号码，方便客服核对）
@@ -1277,8 +1737,9 @@ async function apiReferralBind(request, env) {
     }
   }
 
-  const per = inviteWish(env);
-  const r = await __db.bindReferralTx({ inviterId, inviteeId: user.id, wish: per });
+  const per = inviteWish(env);   // 旧字段，已不再发放任何「愿望」，保留只为兼容旧调用
+  void per;
+  const r = await __db.bindReferralTx({ inviterId, inviteeId: user.id, wish: 0 });
   if (!r.ok) {
     const map = {
       self: ['self', '不能填自己的ID'],
@@ -1291,19 +1752,23 @@ async function apiReferralBind(request, env) {
     return json({ ok: false, error: code, message }, code === 'db_error' ? 500 : 400);
   }
 
+  // 按门槛给邀请人补发免费次数（幂等：只补差额，不会重复发）
+  const granted = await grantInviteCredits(inviterId);
+
   await kvAddLog(env.BTSMKV, {
     userId: user.id, action: 'referral_bind',
-    detail: `inviter=${inviterId} wish=${r.wish}`,
+    detail: `inviter=${inviterId} 免费取号+${granted.serial} 免费验证码+${granted.socket}`,
     ip: getClientIp(request), nickname: user.nickname, openid: user.openid,
   });
 
   return json({
     ok: true,
     inviter_id: inviterId,
-    wish: r.wish,
-    message: r.wish > 0
-      ? `绑定成功，已给邀请人（ID ${inviterId}）发放 ${r.wish} 个愿望`
-      : `绑定成功（后台当前未开启邀请奖励，不发放愿望）`,
+    free_serial: granted.serial,
+    free_socket: granted.socket,
+    message: (granted.serial + granted.socket) > 0
+      ? `绑定成功，已给邀请人（ID ${inviterId}）发放 ${granted.serial} 次免费取号、${granted.socket} 次免费验证码`
+      : '绑定成功（邀请人还差人数才能拿到免费次数）',
   });
 }
 
@@ -1463,14 +1928,15 @@ async function apiSerialClaim(request, env) {
     return json({ ok: true, repeated: true, ...publicSerialRow(existed) });
   }
 
-  // ② 「邀请制」：不再有手机号首免，每次取号都扣愿望。
-  //    愿望来源：新用户注册赠送、邀请好友奖励、购买。
-  const WISH_COST = wishCost(env);
-  const mode = 'wish';
-  if (Number(user.xpay_count || 0) < WISH_COST) {
+  // ② 只支持「免费额度取号」：邀请好友得来的免费次数。
+  //    没有免费次数就返回 need_payment，前端转成「付费下单 → 支付 → 发货发号」。
+  const mode = 'free';
+  if (Number(user.free_serial || 0) < 1) {
+    const price = await goodsPricing();
     return json({
-      ok: false, error: 'need_wish', message: `愿望不足，取号需要 ${WISH_COST} 个愿望`,
-      need: WISH_COST, wish_left: Number(user.xpay_count || 0),
+      ok: false, error: 'need_payment', message: '没有免费取号次数，请支付后取号',
+      price: toYuan(price.serial && price.serial.goodsPrice),
+      product_id: price.serial ? price.serial.productId : '',
     }, 402);
   }
 
@@ -1493,10 +1959,11 @@ async function apiSerialClaim(request, env) {
 
     const serial = String(data.serial);
     const ts = now();
-    const cost = mode === 'wish' ? WISH_COST : 0;
+    const cost = 0;
 
     const tx = await __db.claimSerialTx({
       userId: user.id,
+      credit: 1,
       cost,
       row: {
         user_id: user.id, openid: user.openid, serial, category, version,
@@ -1507,12 +1974,11 @@ async function apiSerialClaim(request, env) {
     });
 
     if (!tx.ok) {
-      if (tx.error === 'need_wish') {
-        // 事务已回滚（没扣愿望也没落库），把号还回池子
+      if (tx.error === 'need_credit') {
+        // 事务已回滚（没扣免费次数也没落库），把号还回池子
         try { await btkeyRequest(env, '/api/release', { method: 'POST', body: { serial, request_id: claimId } }); } catch { /* ignore */ }
         return json({
-          ok: false, error: 'need_wish', message: '愿望不足，请先购买愿望',
-          need: WISH_COST, wish_left: Number(user.xpay_count || 0),
+          ok: false, error: 'need_payment', message: '免费取号次数已用完，请支付后取号',
         }, 402);
       }
 
@@ -1546,9 +2012,9 @@ async function apiSerialClaim(request, env) {
     return json({
       ok: true, serial, category, version,
       download_url: downloadUrl, key_url: keyUrl,
-      source: mode, cost,
+      source: mode, cost: 0,
       status: 'issued', status_text: '未激活', claimed_at: ts,
-      wish_left: Number((fresh && fresh.xpay_count) || 0),
+      free_serial: Number((fresh && fresh.free_serial) || 0),
     });
   }
 
@@ -1613,15 +2079,15 @@ async function apiSerialMine(request, env, url) {
     }
   }
 
-  // 邀请制：不再有免费额度，每次取号都扣愿望
+  // 直购模型：免费次数来自邀请好友，不再是余额
   const total = await __db.countUserSerials(user.id);
   return json({
     ok: true,
     synced,
-    free_used: true,          // 兼容老客户端字段：恒为「已没有免费额度」
-    free_left: 0,
-    wish_left: Number(user.xpay_count || 0),
-    cost: wishCost(env),
+    free_used: false,
+    free_left: Number(user.free_serial || 0),
+    free_serial: Number(user.free_serial || 0),
+    cost: 0,
     phone_bound: hasPhoneUser(user),
     total,
     page,
@@ -1719,7 +2185,7 @@ async function apiSocketCodes(request, env) {
     return json({
       ok: true, repeated: true,
       cost: Number(existedBatch.cost || 0),
-      wish_left: Number((fresh && fresh.xpay_count) || 0),
+      free_socket: Number((fresh && fresh.free_socket) || 0),
       items: rows.map(publicCodeRow),
     });
   }
@@ -1744,19 +2210,27 @@ async function apiSocketCodes(request, env) {
     }, 400);
   }
 
-  // ③ 余额：单个消耗以后台「智能插座验证码」页面设置为准（默认 1）
-  const unit = socketCost();
-  const cost = valid.length * unit;
-  if (Number(user.xpay_count || 0) < cost) {
+  // ③ 只支持「免费额度验证码」：1 次免费额度 = 1 个验证码。
+  //    多个 MAC 或不满足免费条件 → 返回 need_payment，前端走付费下单。
+  const price = await goodsPricing();
+  const unitCents = Number((price.socket && price.socket.goodsPrice) || 0);
+  if (valid.length !== 1 || Number(user.free_socket || 0) < 1) {
     return json({
-      ok: false, error: 'need_wish', message: '愿望不足，请先购买愿望',
-      need: cost, wish_left: Number(user.xpay_count || 0),
+      ok: false, error: 'need_payment',
+      message: valid.length !== 1
+        ? '免费额度每次只能生成 1 个验证码，多个请支付后生成'
+        : '没有免费验证码次数，请支付后生成',
+      price: toYuan(unitCents),
+      quantity: valid.length,
+      total: toYuan(unitCents * valid.length),
+      product_id: price.socket ? price.socket.productId : '',
     }, 402);
   }
+  const cost = 0;
 
   // ④ 扣愿望 + 落库（一个事务，失败全撤销）
   const rows = valid.map((mac) => ({ mac, code: socketCodeOf(mac), kind: 'socket', openid: user.openid }));
-  const tx = await __db.createCodeBatchTx({ userId: user.id, requestId, cost, rows });
+  const tx = await __db.createCodeBatchTx({ userId: user.id, requestId, credit: 1, cost: 0, rows });
 
   if (!tx.ok) {
     if (tx.error === 'duplicate_request') {
@@ -1766,17 +2240,17 @@ async function apiSocketCodes(request, env) {
         const fresh = await __db.getUserById(user.id);
         return json({
           ok: true, repeated: true, cost: Number(batch.cost || 0),
-          wish_left: Number((fresh && fresh.xpay_count) || 0),
+          free_socket: Number((fresh && fresh.free_socket) || 0),
           items: old.map(publicCodeRow),
         });
       }
       return json({ ok: false, error: 'request_id_conflict' }, 409);
     }
-    if (tx.error === 'need_wish') {
+    if (tx.error === 'need_credit') {
       const fresh = await __db.getUserById(user.id);
       return json({
-        ok: false, error: 'need_wish', message: '愿望不足，请先购买愿望',
-        need: cost, wish_left: Number((fresh && fresh.xpay_count) || 0),
+        ok: false, error: 'need_payment', message: '免费验证码次数已用完，请支付后生成',
+        price: toYuan(unitCents), free_socket: Number((fresh && fresh.free_socket) || 0),
       }, 402);
     }
     return json({ ok: false, error: 'db_error', message: '服务器忙，请稍后重试' }, 500);
@@ -1791,8 +2265,8 @@ async function apiSocketCodes(request, env) {
   const fresh = await __db.getUserById(user.id);
   return json({
     ok: true,
-    cost,
-    wish_left: Number((fresh && fresh.xpay_count) || 0),
+    cost: 0,
+    free_socket: Number((fresh && fresh.free_socket) || 0),
     items: rows.map((r) => publicCodeRow({ mac: r.mac, code: r.code, created_at: tx.created_at })),
   });
 }
@@ -1945,14 +2419,14 @@ async function adminIndex(request, env, url) {
 function adminLoginPage(env) {
   const title = env.APP_NAME || 'Admin';
   return html(`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="zh-CN"><head>${THEME_BOOT}<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)} · 后台登录</title>
-<style>
-body{margin:0;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:#f2f4f7;display:flex;align-items:center;justify-content:center;min-height:100vh}
-.card{background:#fff;padding:32px;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.08);width:320px}
-h1{font-size:18px;margin:0 0 20px;color:#1f2937}
-input{width:100%;box-sizing:border-box;padding:10px 12px;margin:6px 0 14px;border:1px solid #d1d5db;border-radius:8px;font-size:14px}
-button{width:100%;padding:10px;background:#2563eb;color:#fff;border:0;border-radius:8px;font-size:15px;cursor:pointer}
+<style>${DARK}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:var(--panel);border:1px solid var(--line);padding:32px;border-radius:16px;box-shadow:0 12px 40px rgba(15,23,42,.18);width:340px}
+h1{font-size:18px;margin:0 0 20px;color:var(--fg)}
+input{width:100%;box-sizing:border-box;margin:6px 0 14px}
+button{width:100%;padding:11px;background:linear-gradient(135deg,var(--brand2),#38bdf8)}
 </style></head><body>
 <form class="card" method="post" action="/${env.ADMIN_PREFIX||'admin'}/login">
   <h1>${escapeHtml(title)} · 管理后台</h1>
@@ -2055,8 +2529,9 @@ async function adminApiUsers(request, env, url) {
   const inviteCounts = __db.countInvitesByUser();
   const slice = users.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize).map(u => ({
     id: u.id, openid: u.openid, nickname: u.nickname, phone: u.phone,
-    count: Number(u.xpay_count || 0),
-    total: Number(u.xpay_total || 0),
+    free_serial: Number(u.free_serial || 0),   // 剩余免费取号次数（邀请获得）
+    free_socket: Number(u.free_socket || 0),   // 剩余免费验证码次数
+    level_name: vipInfo(u).level_name,         // 会员 / SVIP / SVIP+（看累计实付）
     spent: toYuan(u.xpay_spent),
     serials: Number(serialCounts[Number(u.id)] || 0),
     codes: Number(codeCounts[Number(u.id)] || 0),
@@ -2080,16 +2555,51 @@ async function adminApiOrders(request, env, url) {
   const total = orders.length;
   const slice = orders.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize).map(o => ({
     id: o.id, outTradeNo: o.outTradeNo, userId: o.userId,
+    kind: o.kind || '',
     productName: o.productName, productId: o.productId,
-    price: toYuan(o.goodsPrice), times: Number(o.times || 1) * Number(o.buyQuantity || 1),
-    status: o.status, mock: !!o.mock, wxOrderId: o.wxOrderId || '',
+    price: toYuan(o.goodsPrice), quantity: Number(o.buyQuantity || 1),
+    status: o.status, deliver_status: o.deliver_status || '', note: o.note || '',
+    result: o.deliver_result || '',
+    mock: !!o.mock, wxOrderId: o.wxOrderId || '',
     createdAt: o.createdAt, deliveredAt: o.deliveredAt
   }));
   return json({ total, page, pageSize, orders: slice });
 }
 
-async function adminApiStats(request, env) {
+/**
+ * POST /admin/api/orders/redeliver  body: { order_id }
+ * 发号失败 / 推送丢失时手动补发：按订单类型重新发号或生成验证码（内部幂等）。
+ */
+async function adminApiOrderRedeliver(request, env) {
   const session = await authAdmin(request, env);
+  if (!session) return json({ error: 'unauthorized' }, 401);
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'bad_json' }, 400); }
+
+  const order = await kvGetOrder(env.BTSMKV, String(body.order_id || ''));
+  if (!order) return json({ error: 'not_found' }, 404);
+  if (order.status === ST.DELIVERED) {
+    return json({ ok: true, order: publicOrder(order), note: 'already_delivered' });
+  }
+
+  const before = order.deliver_status || '';
+  const out = await deliverOrder(env, order);
+  const okNow = out.deliver_status === 'issued';
+
+  await kvAddLog(env.BTSMKV, {
+    userId: Number(out.userId || 0), action: 'admin_redeliver',
+    detail: `order=${out.id} ${before}→${out.deliver_status} by ${session.sub}`,
+    ip: getClientIp(request),
+  });
+  return json({
+    ok: okNow,
+    order: publicOrder(out),
+    error: okNow ? '' : (out.note || 'deliver_failed'),
+  });
+}
+
+async function adminApiStats(request, env) {  const session = await authAdmin(request, env);
   if (!session) return json({ error:'unauthorized' }, 401);
   // 有效用户：购买过 / 取过号 / 生成过验证码（三类并集去重，db 层算），不看当前余额
   const active = await __db.countActiveUsers();
@@ -2143,24 +2653,16 @@ async function adminApiUpdateUser(request, env, id) {
   if (typeof body.remark === 'string')   user.remark = body.remark.slice(0,255);
   if (body.status !== undefined)         user.status = Number(body.status) ? 1 : 0;
 
-  // 次数：支持「设为」与「增加」两种模式
-  const beforeCount = Number(user.xpay_count || 0);
-  if (body.count !== undefined && body.count !== '') {
-    const n = Math.max(0, Math.round(Number(body.count) || 0));
-    if (body.count_mode === 'add') {
-      user.xpay_count = beforeCount + n;
-      // 手工增加次数视为一次购买记录，同步累计购买
-      if (n > 0) user.xpay_total = Number(user.xpay_total||0) + n;
-    } else {
-      user.xpay_count = n;
-    }
-  }
-
-  // 累计购买次数：直接设为指定值（传空字符串则清零）
-  if (body.total !== undefined) {
-    if (body.total === '') user.xpay_total = 0;
-    else if (Number.isFinite(Number(body.total))) user.xpay_total = Math.max(0, Math.round(Number(body.total)));
-  }
+  // 免费次数：取号 / 验证码分开，各自支持「设为」与「增加」两种模式
+  const beforeFreeSerial = Number(user.free_serial || 0);
+  const beforeFreeSocket = Number(user.free_socket || 0);
+  const applyFree = (raw, before) => {
+    if (raw === undefined || raw === '') return before;
+    const n = Math.max(0, Math.round(Number(raw) || 0));
+    return body.count_mode === 'add' ? before + n : n;
+  };
+  user.free_serial = applyFree(body.free_serial, beforeFreeSerial);
+  user.free_socket = applyFree(body.free_socket, beforeFreeSocket);
 
   // 累计消费：按「元」传参，内部存分（传空字符串则清零）
   if (body.spent !== undefined) {
@@ -2175,7 +2677,7 @@ async function adminApiUpdateUser(request, env, id) {
   const idChange = renamedFrom !== null ? ` 用户ID #${renamedFrom}→#${user.id}；` : '';
   await kvAddLog(env.BTSMKV, {
     userId:user.id, action:'admin_update',
-    detail:`by ${session.sub}${idChange} 次数=${beforeCount}→${user.xpay_count} 累计购买=${user.xpay_total} 累计消费=${toYuan(user.xpay_spent)}元`,
+    detail:`by ${session.sub}${idChange} 免费取号=${beforeFreeSerial}→${user.free_serial} 免费验证码=${beforeFreeSocket}→${user.free_socket} 累计消费=${toYuan(user.xpay_spent)}元`,
     ip:getClientIp(request), nickname:user.nickname, openid:user.openid
   });
   return json({ ok:true, user: publicUser(user) });
@@ -2216,7 +2718,7 @@ async function adminApiDeleteUsers(request, env) {
   for (const u of removed) {
     await kvAddLog(env.BTSMKV, {
       userId: u.id, action: 'admin_user_delete',
-      detail: `by ${session.sub} 删除用户 #${u.id} 昵称=${u.nickname || ''} 剩余愿望=${u.xpay_count}；领号/插座记录已清除，订单与日志保留`,
+      detail: `by ${session.sub} 删除用户 #${u.id} 昵称=${u.nickname || ''} 免费取号=${u.free_serial||0} 免费验证码=${u.free_socket||0}；领号/插座记录已清除，订单与日志保留`,
       ip: getClientIp(request), nickname: u.nickname, openid: u.openid
     });
   }
@@ -2334,8 +2836,8 @@ async function adminSaveSerialSettings(request, env) {
   const n = Math.floor(Number(form.get('cost')));
   if (!Number.isInteger(n) || n < 0 || n > 999) return back('消耗数需为 0-999 的整数（0 = 免费）');
   await __db.setSetting('serial_wish_cost', String(n));
-  await kvAddLog(env.BTSMKV, { userId: 0, action: 'admin_set_serial_cost', detail: `by ${session.sub} 取号消耗改为 ${n}` });
-  return back(n === 0 ? '已保存：取号不消耗愿望（免费）' : `取号消耗已保存：每次 ${n} 个愿望`);
+  await kvAddLog(env.BTSMKV, { userId: 0, action: 'admin_set_serial_cost', detail: `by ${session.sub} 旧「消耗次数」写入 ${n}（已失效）` });
+  return back('该设置已下线：现在按次直购，取号价格请在「系统设置 → 直购价格档位」里选');
 }
 
 /** POST /admin/codes/settings  form:{cost} 保存「每个验证码消耗愿望数」 */
@@ -2351,8 +2853,8 @@ async function adminSaveSocketSettings(request, env) {
   const n = Math.floor(Number(form.get('cost')));
   if (!Number.isInteger(n) || n < 0 || n > 999) return back('消耗数需为 0-999 的整数（0 = 免费）');
   await __db.setSetting('socket_cost', String(n));
-  await kvAddLog(env.BTSMKV, { userId: 0, action: 'admin_set_socket_cost', detail: `by ${session.sub} 单个验证码消耗改为 ${n}` });
-  return back(n === 0 ? '已保存：生成验证码不消耗愿望（免费）' : `验证码消耗已保存：每个 ${n} 个愿望`);
+  await kvAddLog(env.BTSMKV, { userId: 0, action: 'admin_set_socket_cost', detail: `by ${session.sub} 旧「消耗次数」写入 ${n}（已失效）` });
+  return back('该设置已下线：现在按个直购，验证码价格请在「系统设置 → 直购价格档位」里选');
 }
 
 /** 轻量 CSV 解析：支持双引号包裹、"" 转义、CRLF；返回二维字符串数组 */
@@ -2411,7 +2913,9 @@ async function adminImportUsers(request, env, url) {
 
   const head = grid[0];
   const iId = csvColIndex(head, ['id', '用户ID', '用户id', '编号']);
-  const iBal = csvColIndex(head, ['xpay_count', '愿望', '余额', '剩余愿望', 'wish', 'count']);
+  // 免费次数（取号 / 验证码分开）；旧表头里的 wish/count/愿望 一律按「免费取号次数」处理
+  const iFreeSerial = csvColIndex(head, ['free_serial', '免费取号次数', '取号次数', 'xpay_count', '愿望', '余额', '剩余愿望', 'wish', 'count']);
+  const iFreeSocket = csvColIndex(head, ['free_socket', '免费验证码次数', '验证码次数']);
   const iNick = csvColIndex(head, ['nickname', '昵称', '名字']);
   const iPhone = csvColIndex(head, ['phone', '手机号', '电话']);
   if (iId < 0) return back('未识别到「用户ID」列（表头需包含 id 或 用户ID）');
@@ -2422,7 +2926,8 @@ async function adminImportUsers(request, env, url) {
     const id = (cells[iId] || '').trim();
     if (id === '') continue;
     const row = { id };
-    if (iBal >= 0) row.xpay_count = (cells[iBal] || '').trim();
+    if (iFreeSerial >= 0) row.free_serial = (cells[iFreeSerial] || '').trim();
+    if (iFreeSocket >= 0) row.free_socket = (cells[iFreeSocket] || '').trim();
     if (iNick >= 0) row.nickname = (cells[iNick] || '').trim();
     if (iPhone >= 0) row.phone = (cells[iPhone] || '').trim();
     rows.push(row);
@@ -2456,7 +2961,7 @@ async function adminImportTable(request, env, url) {
   if (grid.length < 2) return back('CSV 为空或只有表头，没有可导入的数据行');
 
   const head = grid[0].map(h => String(h == null ? '' : h).trim());
-  const allCols = ['id','user_id','action','detail','ip','nickname','openid','created_at',
+  const allCols = ['id','user_id','action','detail','ip','nickname','openid','device','created_at',
     'outTradeNo','userId','productId','productName','goodsPrice','buyQuantity','times','status','mock','note','createdAt','deliveredAt',
     'serial','category','version','source','cost','activated_at','claimed_at','remark',
     'kind','mac','code','inviter_id','invitee_id','wish'];
@@ -2529,39 +3034,71 @@ async function adminSettingsPage(request, env, url) {
       return String(Number.isInteger(n) && n >= 0 ? n : def);
     };
 
-    const newWish = num('new_user_wish', DEFAULT_NEW_USER_WISH);
-    const invite = num('invite_wish', DEFAULT_INVITE_WISH);
-    const days = num('invite_window_days', DEFAULT_INVITE_WINDOW_DAYS);
-    // 消耗设置：0-999 整数，0 = 免费
-    const cost0to999 = (k, def) => {
+    const days = num('invite_window_days', inviteWindowDays());
+    // 0-999 整数（0 = 关闭 / 不限）
+    const zero999 = (k, def) => {
       const raw = pick(k);
       if (raw === '') return String(def);
       const n = Math.floor(Number(raw));
       return String(Number.isInteger(n) && n >= 0 && n <= 999 ? n : def);
     };
-    const serialCostV = cost0to999('serial_wish_cost', serialCost(env));
-    const socketCostV = cost0to999('socket_cost', socketCost());
+    const serialNeed = zero999('serial_invite_need', serialInviteNeed());
+    const socketNeed = zero999('socket_invite_need', socketInviteNeed());
+    const freeMax = zero999('invite_free_max', inviteFreeMax());
+    const newCredit = zero999('new_user_free_credit', intSetting('new_user_free_credit', 0, 0, 99));
+    const svip1 = zero999('svip1_spent', intSetting('svip1_spent', 100, 0, 1000000));
+    const svip2 = zero999('svip2_spent', intSetting('svip2_spent', 300, 0, 1000000));
 
-    __db.setSetting('new_user_wish', newWish);
-    __db.setSetting('invite_wish', invite);
+    // 价格档位只能选「道具配置」里存在的 productId，避免下单时找不到档位
+    const tierList = await kvGetProducts(env.BTSMKV);
+    const pickTier = (k, def) => {
+      const v = pick(k);
+      return tierList.some(p => p.productId === v) ? v : def;
+    };
+    const serialTier = pickTier('serial_tier', serialTierId());
+    const socketTier = pickTier('socket_tier', socketTierId());
+
+    // 客服入口开关
+    const b01 = (k, def) => {
+      const raw = pick(k);
+      return raw === '0' ? '0' : (raw === '1' ? '1' : String(def));
+    };
+    const csOn = b01('cs_enabled', csEnabled());
+    const csG = b01('cs_guest', csGuest());
+    const csV = b01('cs_vip', csVip());
+    const csS = b01('cs_svip', csSvip());
+
     __db.setSetting('invite_window_days', days);
-    __db.setSetting('invite_intro', pick('invite_intro').slice(0, 2000));
-    __db.setSetting('serial_intro', pick('serial_intro').slice(0, 2000));
-    __db.setSetting('serial_wish_cost', serialCostV);
-    __db.setSetting('socket_cost', socketCostV);
+    // 文案是「有才更新」：客服面板只提交客服字段，不能把这三段文案清空
+    if (form.has('invite_intro')) __db.setSetting('invite_intro', pick('invite_intro').slice(0, 2000));
+    if (form.has('serial_intro')) __db.setSetting('serial_intro', pick('serial_intro').slice(0, 2000));
+    if (form.has('purchase_notice')) __db.setSetting('purchase_notice', pick('purchase_notice').slice(0, 4000));
+    __db.setSetting('cs_enabled', csOn);
+    __db.setSetting('cs_guest', csG);
+    __db.setSetting('cs_vip', csV);
+    __db.setSetting('cs_svip', csS);
+    __db.setSetting('serial_invite_need', serialNeed);
+    __db.setSetting('socket_invite_need', socketNeed);
+    __db.setSetting('invite_free_max', freeMax);
+    __db.setSetting('new_user_free_credit', newCredit);
+    __db.setSetting('svip1_spent', svip1);
+    __db.setSetting('svip2_spent', svip2);
+    __db.setSetting('serial_tier', serialTier);
+    __db.setSetting('socket_tier', socketTier);
 
     await kvAddLog(env.BTSMKV, {
       userId: 0, action: 'admin_settings_save',
-      detail: `new_user_wish=${newWish} invite_wish=${invite} window=${days}d serial_cost=${serialCostV} socket_cost=${socketCostV} by ${session.sub}`,
+      detail: `serial_tier=${serialTier} socket_tier=${socketTier} serial_need=${serialNeed} socket_need=${socketNeed} free_max=${freeMax} new_credit=${newCredit} svip=${svip1}/${svip2} by ${session.sub}`,
     });
     const msg = encodeURIComponent(
-      `已保存：新用户送 ${newWish}，每邀请 1 人送 ${invite}，绑定时限 ${days} 天；取号每次 ${serialCostV} 个，验证码每个 ${socketCostV} 个愿望`
+      `已保存：取号档位 ${serialTier}、验证码档位 ${socketTier}；邀请 ${serialNeed} 人送 1 次免费取号、${socketNeed} 人送 1 次免费验证码；SVIP 满 ${svip1} 元、SVIP+ 满 ${svip2} 元；客服入口${csOn === '1' ? '开启' : '关闭'}`
     );
     return Response.redirect(new URL('/' + adminPrefix + '/settings?m=' + msg, url.origin).toString(), 302);
   }
 
   const msg = (url.searchParams.get('m') || '').trim();
   const referrals = __db.listReferrals({ limit: 50, offset: 0 });
+  const tierList = (await kvGetProducts(env.BTSMKV)).slice().sort((a, b) => (a.sort || 0) - (b.sort || 0));
   const totalRef = __db.countReferrals();
   const rows = referrals.map((r) => `<tr>
     <td class="mono">${r.inviter_id}</td>
@@ -2572,71 +3109,74 @@ async function adminSettingsPage(request, env, url) {
     <td class="nowrap">${fmtBeijing(r.created_at)}</td>
     <td class="nowrap">
       <form method="post" action="/${adminPrefix}/referral/cancel" style="display:inline"
-            onsubmit="return confirm('取消这条邀请绑定？\\n邀请人ID ${r.inviter_id} ← 被邀请人ID ${r.invitee_id}\\n取消后被邀请人可以重新填写邀请人。\\n勾选「收回愿望」会从邀请人余额里扣 ${Number(r.wish || 0)} 个（余额不足则按现有余额扣）。')">
+            onsubmit="return confirm('取消这条邀请绑定？\\n邀请人ID ${r.inviter_id} ← 被邀请人ID ${r.invitee_id}\\n取消后被邀请可以重新填写邀请人。\\n注意：已发放的免费次数不会自动收回（如需收回请在用户编辑里改）。')">
         <input type="hidden" name="invitee_id" value="${r.invitee_id}">
-        <label style="font-size:12px;color:#6b7280;margin-right:6px;white-space:nowrap">
-          <input type="checkbox" name="reclaim" value="1" style="width:auto;vertical-align:-1px"> 收回愿望
-        </label>
         <button class="mini danger" type="submit">取消绑定</button>
       </form>
     </td>
   </tr>`).join('');
 
   return html(`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="zh-CN"><head>${THEME_BOOT}<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>系统设置 · ${escapeHtml(env.APP_NAME || '')}</title>
-<style>
-body{margin:0;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:#f2f4f7;color:#1f2937}
-header{background:transparent;border-bottom:none;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
-header h1{font-size:17px;margin:0}
-header a{color:#6b7280;text-decoration:none;font-size:13px;margin-left:16px}
-.wrap{padding:20px 24px;max-width:1100px;margin:0 auto}
-.box{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:18px;margin-bottom:16px}
-.box h2{font-size:15px;margin:0 0 6px}
-.hint{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;padding:10px 14px;border-radius:8px;font-size:13px;line-height:1.8;margin-bottom:14px}
-.hint code{background:#dbeafe;padding:1px 6px;border-radius:4px;font-family:Consolas,Menlo,monospace}
-.msg{background:#dcfce7;color:#166534;padding:8px 12px;border-radius:8px;margin-bottom:12px;font-size:13px}
-label{display:block;font-size:13px;color:#374151;margin:12px 0 4px}
-input[type=number],input[type=text],input[type=file],select,textarea{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:14px}
+<style>${DARK}
+header{background:transparent;border-bottom:1px solid var(--line);padding:16px 24px;display:flex;align-items:center;justify-content:space-between}
+header h1{font-size:17px;margin:0;color:var(--fg)}
+header a{color:var(--muted);font-size:13px;margin-left:16px}
+header a:hover{color:var(--brand)}
+.box h2{font-size:15px;margin:0 0 6px;color:var(--fg)}
+label{display:block;font-size:13px;color:var(--fg);margin:12px 0 4px}
+input[type=number],input[type=text],input[type=file],select,textarea{width:100%;box-sizing:border-box}
 select{width:auto}
 textarea{min-height:90px;line-height:1.6}
 .row{display:flex;gap:16px;flex-wrap:wrap}
 .row>div{flex:1;min-width:200px}
-button{padding:9px 18px;background:#2563eb;color:#fff;border:0;border-radius:8px;font-size:14px;cursor:pointer;margin-top:16px}
-button.mini{padding:4px 10px;font-size:12px;border-radius:6px;border:1px solid #e5b4b0;background:#fdeeec;color:#b3261e;cursor:pointer;margin:0;white-space:nowrap}
+button{margin-top:16px}
+button.mini{padding:4px 10px;font-size:12px;border-radius:6px;border:1px solid var(--err-bg);background:var(--err-bg);color:var(--err);cursor:pointer;margin:0;white-space:nowrap}
 table form{margin:0}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
-th,td{padding:9px 12px;border-bottom:1px solid #e5e7eb;font-size:13px;text-align:left}
-th{background:#fafafa;color:#6b7280;font-weight:500}
-.mono{font-family:Consolas,Menlo,monospace}
-.muted{color:#9ca3af;font-size:12px}
-.money{color:#0f766e;font-weight:600}
 .nowrap{white-space:nowrap}
 .export-list{display:flex;flex-direction:column;gap:8px}
-a.dl{display:inline-block;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;color:#2563eb;text-decoration:none}
-a.dl:hover{background:#eff6ff}
-.danger-box{border-color:#fecaca;background:#fff5f5}
+a.dl{display:inline-flex;align-items:center;gap:6px;padding:9px 13px;background:var(--panel2);border:1px solid var(--line2);border-radius:10px;font-size:13px;color:var(--brand)}
+a.dl:hover{background:rgba(56,189,248,.12);text-decoration:none;border-color:var(--brand)}
 .danger-row{display:flex;gap:24px;flex-wrap:wrap}
 .danger-row>div{flex:1;min-width:260px}
-.btn-danger{background:#dc2626!important;margin-top:8px}
 /* 左侧分类导航 + 右侧面板 */
 .container{display:flex;min-height:100vh}
-.sidebar{width:216px;flex-shrink:0;background:#2c3e50;color:#fff;padding:14px 0;transition:width .3s}
-.sidebar-header{padding:0 16px 12px;margin-bottom:10px;border-bottom:1px dashed #4a5d70;font-size:14px;font-weight:600;white-space:nowrap}
-.menu-item{padding:12px 16px;cursor:pointer;border-left:3px solid transparent;margin-bottom:4px;display:flex;align-items:center;gap:9px;font-size:14px;white-space:nowrap;transition:.2s}
+.sidebar{width:220px;flex-shrink:0;background:var(--side-bg);color:var(--fg);padding:18px 0;border-right:1px solid var(--line)}
+.sidebar-header{padding:0 18px 14px;margin-bottom:10px;border-bottom:1px solid var(--line);font-size:13px;font-weight:600;color:var(--muted);letter-spacing:1px;white-space:nowrap}
+.menu-item{padding:12px 18px;cursor:pointer;border-left:3px solid transparent;margin:2px 10px 2px 0;border-radius:0 10px 10px 0;display:flex;align-items:center;gap:10px;font-size:14px;white-space:nowrap;transition:.2s;color:var(--muted)}
 .menu-item .icon{width:20px;text-align:center}
-.menu-item.active{background:#34495e;border-left-color:#3498db;color:#fff}
-.menu-item:hover{background:#34495e}
-.content{flex:1;padding:20px 24px;max-width:1000px}
+.menu-item.active{background:linear-gradient(90deg,rgba(56,189,248,.18),transparent);border-left-color:var(--brand);color:var(--brand)}
+.menu-item:hover{background:rgba(255,255,255,.05);color:var(--fg)}
+.content{flex:1;min-width:0;padding:20px 24px;max-width:none}
 .panel{display:none}
-.panel.active{display:block}
+.panel.active{display:block;animation:fade .25s ease}
+.theme-row{display:flex;gap:16px;flex-wrap:wrap}
+.theme-card{flex:1;min-width:200px;border:1px solid var(--line2);border-radius:14px;padding:16px;cursor:pointer;background:var(--panel);display:flex;flex-direction:column;gap:8px;transition:.2s}
+.theme-card:hover{border-color:var(--brand);transform:translateY(-2px)}
+.theme-card.on{border-color:var(--brand);box-shadow:0 0 0 2px var(--info-bg)}
+.theme-card b{font-size:15px;color:var(--fg)}
+.preview{height:96px;border-radius:10px;position:relative;overflow:hidden;margin-bottom:4px;border:1px solid var(--line)}
+.pv-dark{background:#0d1117}
+.pv-light{background:#eef1f5}
+.preview .p-bar{position:absolute;top:0;left:0;right:0;height:22px;display:block}
+.pv-dark .p-bar{background:#1d2530}
+.pv-light .p-bar{background:#fff}
+.preview .p-line{position:absolute;left:12px;top:38px;height:8px;width:70%;border-radius:4px;display:block}
+.preview .p-line.short{top:58px;width:45%}
+.pv-dark .p-line{background:#2a313c}
+.pv-light .p-line{background:#cbd5e1}
+.preview .p-dot{position:absolute;right:12px;top:32px;width:26px;height:26px;border-radius:8px;display:block}
+.pv-dark .p-dot{background:#1f6feb}
+.pv-light .p-dot{background:#2563eb}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 @media (max-width:768px){
   .container{flex-direction:column}
-  .sidebar{width:100%;padding:8px 0}
+  .sidebar{width:100%;padding:8px 0;border-right:none;border-bottom:1px solid var(--line)}
   .sidebar-header{display:none}
-  .menu-item{display:inline-flex;border-left:none;border-bottom:3px solid transparent;margin:0 4px;padding:9px 11px;font-size:13px}
-  .menu-item.active{border-left:none;border-bottom-color:#3498db}
+  .menu-item{display:inline-flex;border-left:none;border-bottom:3px solid transparent;margin:0 4px;padding:9px 11px;font-size:13px;border-radius:10px}
+  .menu-item.active{border-left:none;border-bottom-color:var(--brand)}
   .content{padding:14px}
 }
 </style></head><body>
@@ -2652,10 +3192,43 @@ a.dl:hover{background:#eff6ff}
     <div class="menu-item" data-panel="import" onclick="showPanel('import')"><span class="icon">📥</span><span>用户导入</span></div>
     <div class="menu-item" data-panel="danger" onclick="showPanel('danger')"><span class="icon">⚠️</span><span>危险操作</span></div>
     <div class="menu-item" data-panel="referrals" onclick="showPanel('referrals')"><span class="icon">🤝</span><span>邀请记录</span></div>
+    <div class="menu-item" data-panel="service" onclick="showPanel('service')"><span class="icon">💬</span><span>客服入口</span></div>
+    <div class="menu-item" data-panel="theme" onclick="showPanel('theme')"><span class="icon">🎨</span><span>外观皮肤</span></div>
   </div>
 
   <div class="content">
     ${msg ? `<div class="msg">${escapeHtml(msg)}</div>` : ''}
+
+    <div class="panel" id="panel-service">
+      <div class="hint">
+        关掉总开关 = 所有人都看不到「联系客服」。总开关开启时，再按身份分别控制。<br>
+        前提：需先在 MP 后台「功能 → 客服」里添加客服人员，否则用户点了会提示未开启客服功能。
+      </div>
+      <form class="box" method="post" action="/${adminPrefix}/settings">
+        <h2>💬 客服入口</h2>
+        <div class="row">
+          <div>
+            <label>总开关</label>
+            <select name="cs_enabled">${optOnOff(csEnabled())}</select>
+          </div>
+          <div>
+            <label>未登录用户显示</label>
+            <select name="cs_guest">${optOnOff(csGuest())}</select>
+          </div>
+          <div>
+            <label>VIP 显示</label>
+            <select name="cs_vip">${optOnOff(csVip())}</select>
+          </div>
+          <div>
+            <label>SVIP / SVIP+ 显示</label>
+            <select name="cs_svip">${optOnOff(csSvip())}</select>
+          </div>
+        </div>
+        <div style="margin-top:16px">
+          <button class="primary" type="submit">保存客服设置</button>
+        </div>
+      </form>
+    </div>
 
     <div class="panel active" id="panel-rules">
       <div class="hint">
@@ -2663,15 +3236,35 @@ a.dl:hover{background:#eff6ff}
         绑定时限：被邀请人必须在注册后 N 天内填写邀请人，<code>0</code> = 不限制。改完点「保存设置」立即生效。
       </div>
       <form class="box" method="post" action="/${adminPrefix}/settings">
-        <h2>🎁 发放规则（邀请 / 赠送）</h2>
+        <h2>💳 直购价格档位（必须与微信虚拟支付道具一致）</h2>
         <div class="row">
           <div>
-            <label>新用户注册赠送愿望（默认 1，0 = 不送）</label>
-            <input type="number" name="new_user_wish" min="0" step="1" value="${newUserWish(env)}">
+            <label>取号用哪个档位（付款就是该档金额）</label>
+            <select name="serial_tier">${tierOptionsHtml(tierList, serialTierId())}</select>
           </div>
           <div>
-            <label>每邀请 1 个新用户赠送愿望（默认 5，0 = 不送）</label>
-            <input type="number" name="invite_wish" min="0" step="1" value="${inviteWish(env)}">
+            <label>验证码用哪个档位（每个）</label>
+            <select name="socket_tier">${tierOptionsHtml(tierList, socketTierId())}</select>
+          </div>
+        </div>
+
+        <h2 style="margin-top:22px">🎁 邀请免费次数 / 注册赠送</h2>
+        <div class="row">
+          <div>
+            <label>邀请几人送 1 次免费取号（默认 2，0 = 不开启）</label>
+            <input type="number" name="serial_invite_need" min="0" max="999" step="1" value="${serialInviteNeed()}">
+          </div>
+          <div>
+            <label>邀请几人送 1 次免费验证码（默认 0 = 不开启）</label>
+            <input type="number" name="socket_invite_need" min="0" max="999" step="1" value="${socketInviteNeed()}">
+          </div>
+          <div>
+            <label>免费次数最多送几次（0 = 不限）</label>
+            <input type="number" name="invite_free_max" min="0" max="999" step="1" value="${inviteFreeMax()}">
+          </div>
+          <div>
+            <label>新用户注册送几次免费取号（0 = 不送）</label>
+            <input type="number" name="new_user_free_credit" min="0" max="99" step="1" value="${intSetting('new_user_free_credit', 0, 0, 99)}">
           </div>
           <div>
             <label>绑定时限（天，默认 7，0 = 不限）</label>
@@ -2679,15 +3272,15 @@ a.dl:hover{background:#eff6ff}
           </div>
         </div>
 
-        <h2 style="margin-top:22px">⚡ 消耗设置（每次操作扣多少愿望）</h2>
+        <h2 style="margin-top:22px">💎 VIP 等级（按累计实付金额升级，与余额无关）</h2>
         <div class="row">
           <div>
-            <label>序列号取号：每次取号消耗愿望（默认 10，0 = 免费）</label>
-            <input type="number" name="serial_wish_cost" min="0" max="999" step="1" value="${serialCost(env)}">
+            <label>累计实付满多少元升 SVIP（默认 100）</label>
+            <input type="number" name="svip1_spent" min="0" step="1" value="${intSetting('svip1_spent', 100, 0, 1000000)}">
           </div>
           <div>
-            <label>智能插座验证码：每生成 1 个消耗愿望（默认 1，0 = 免费）</label>
-            <input type="number" name="socket_cost" min="0" max="999" step="1" value="${socketCost()}">
+            <label>累计实付满多少元升 SVIP+（默认 300）</label>
+            <input type="number" name="svip2_spent" min="0" step="1" value="${intSetting('svip2_spent', 300, 0, 1000000)}">
           </div>
         </div>
 
@@ -2697,6 +3290,9 @@ a.dl:hover{background:#eff6ff}
 
         <label>序列号取号页底部说明（留空 = 用内置默认）</label>
         <textarea name="serial_intro" placeholder="${escapeHtml(defaultSerialIntro(env))}">${escapeHtml(settingText('serial_intro', ''))}</textarea>
+
+        <label>「购买须知」内容（小程序「我的 → 说明」页，留空 = 用内置默认；一行一条）</label>
+        <textarea name="purchase_notice" placeholder="${escapeHtml(defaultPurchaseNotice(env))}">${escapeHtml(settingText('purchase_notice', ''))}</textarea>
 
         <button type="submit">保存设置</button>
       </form>
@@ -2722,12 +3318,12 @@ a.dl:hover{background:#eff6ff}
         <h2>👤 导入 / 修改用户（按ID更新，不清空）</h2>
         <p class="muted" style="margin:6px 0 12px">
           上传用户 CSV，按<b>用户ID</b>匹配已存在用户并更新；ID 不存在的行自动跳过，不会新建用户。<br>
-          表头支持：<code>id,xpay_count,nickname,phone</code>（也认中文「用户ID / 愿望 / 昵称 / 手机号」）。<br>
-          <code>xpay_count</code> 填了就<b>设置为该余额</b>（不是累加）；留空的列不修改。
+          表头支持：<code>id,free_serial,free_socket,nickname,phone</code>（也认中文「免费取号次数 / 免费验证码次数 / 昵称 / 手机号」）。<br>
+          <code>free_serial</code> / <code>free_socket</code> 填了就<b>设置为该次数</b>（不是累加）；留空的列不修改。
         </p>
         <form method="post" action="/${adminPrefix}/settings/import-users" enctype="multipart/form-data">
-          <input type="file" name="file" accept=".csv,text/csv" required style="padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;max-width:100%">
-          <button type="submit" style="background:#0f766e">上传并更新用户</button>
+          <input type="file" name="file" accept=".csv,text/csv" required style="padding:8px;border:1px solid var(--line2);border-radius:8px;font-size:14px;max-width:100%">
+          <button type="submit" style="background:var(--brand2)">上传并更新用户</button>
         </form>
       </div>
 
@@ -2739,7 +3335,7 @@ a.dl:hover{background:#eff6ff}
         <form method="post" action="/${adminPrefix}/settings/import-table" enctype="multipart/form-data"
               onsubmit="return confirm('整表恢复将先清空所选表现有数据再写入，确定继续？')">
           <label style="display:block;font-size:13px;margin:6px 0 4px">选择要恢复的表</label>
-          <select name="table" required style="padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;min-width:220px">
+          <select name="table" required style="padding:8px 10px;border:1px solid var(--line2);border-radius:8px;font-size:14px;min-width:220px">
             <option value="logs">审计日志（logs）</option>
             <option value="orders">订单（orders）</option>
             <option value="serials">序列号领取记录（serials）</option>
@@ -2747,7 +3343,7 @@ a.dl:hover{background:#eff6ff}
             <option value="referrals">邀请记录（referrals）</option>
           </select>
           <br>
-          <input type="file" name="file" accept=".csv,text/csv" required style="padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;max-width:100%;margin-top:10px">
+          <input type="file" name="file" accept=".csv,text/csv" required style="padding:8px;border:1px solid var(--line2);border-radius:8px;font-size:14px;max-width:100%;margin-top:10px">
           <button type="submit" class="btn-danger">整表恢复</button>
         </form>
       </div>
@@ -2787,9 +3383,28 @@ a.dl:hover{background:#eff6ff}
       <div class="box">
         <h2>最近邀请记录（共 ${totalRef} 条，显示最近 50 条）</h2>
         <table>
-          <thead><tr><th>邀请人ID</th><th>邀请人</th><th>被邀请ID</th><th>被邀请人</th><th>发放愿望</th><th>时间</th><th>操作</th></tr></thead>
+          <thead><tr><th>邀请人ID</th><th>邀请人</th><th>被邀请ID</th><th>被邀请人</th><th>发放免费次数</th><th>时间</th><th>操作</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="7" class="muted" style="text-align:center;padding:18px">还没有邀请记录</td></tr>'}</tbody>
         </table>
+      </div>
+    </div>
+
+    <div class="panel" id="panel-theme">
+      <div class="box">
+        <h2>🎨 外观皮肤</h2>
+        <p class="muted" style="margin:6px 0 16px">选择后台配色，仅保存在本机浏览器，刷新或重开仍保留，不影响其他管理员。</p>
+        <div class="theme-row">
+          <div class="theme-card" data-theme="dark" onclick="setTheme('dark')">
+            <div class="preview pv-dark"><i class="p-bar"></i><i class="p-line"></i><i class="p-line short"></i><i class="p-dot"></i></div>
+            <b>深色模式</b>
+            <span class="muted">深色科技风，夜间护眼</span>
+          </div>
+          <div class="theme-card" data-theme="light" onclick="setTheme('light')">
+            <div class="preview pv-light"><i class="p-bar"></i><i class="p-line"></i><i class="p-line short"></i><i class="p-dot"></i></div>
+            <b>浅色模式</b>
+            <span class="muted">明亮清爽，对比柔和</span>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -2803,9 +3418,21 @@ function showPanel(name){
   var item=document.querySelector('.menu-item[data-panel="'+name+'"]');
   if(item)item.classList.add('active');
 }
+function setTheme(t){
+  if(t!=='light'&&t!=='dark')t='dark';
+  localStorage.setItem('admin-theme',t);
+  document.documentElement.setAttribute('data-theme',t);
+  document.querySelectorAll('.theme-card').forEach(function(c){
+    c.classList.toggle('on',c.getAttribute('data-theme')===t);
+  });
+}
 (function(){
   var h=(location.hash||'').replace('#','');
   if(h&&document.getElementById('panel-'+h))showPanel(h);
+  var cur=document.documentElement.getAttribute('data-theme')||'dark';
+  document.querySelectorAll('.theme-card').forEach(function(c){
+    c.classList.toggle('on',c.getAttribute('data-theme')===cur);
+  });
 })();
 </script>
 </body></html>`);
@@ -2896,13 +3523,13 @@ async function adminSerialsPage(request, env, url) {
         <button class="mini danger">删除·作废</button></form>`;
   };
 
-  const trs = list.map((r) => `<tr${Number(r.hidden || 0) === 1 ? ' style="background:#fffdf6"' : ''}>
+  const trs = list.map((r) => `<tr${Number(r.hidden || 0) === 1 ? ' style="background:rgba(210,153,34,.07)"' : ''}>
     <td class="mono nowrap">${escapeHtml(r.serial)}</td>
     <td class="ver">${r.version ? escapeHtml(r.version) : '<span class="muted">-</span>'}</td>
     <td class="nowrap">${escapeHtml(r.category || '-')}</td>
     <td class="nowrap">${r.user_id}<br><span class="muted">${escapeHtml(r.nickname || '')}</span></td>
     <td class="nowrap">${escapeHtml(r.phone || '-')}</td>
-    <td class="nowrap">${r.source === 'free' ? '首免' : r.source === 'wish' ? '扣愿望 ' + Number(r.cost || 0) : escapeHtml(r.source || '')}</td>
+    <td class="nowrap">${r.source === 'free' ? '免费额度' : r.source === 'paid' ? '已支付 ' + (Number(r.cost || 0) / 100).toFixed(2) + ' 元' : escapeHtml(r.source || '')}</td>
     <td class="nowrap">${fmt(r.claimed_at)}</td>
     <td class="nowrap">${tagOf(r.status)}${Number(r.hidden || 0) === 1 ? ' <span class="tag hidden">用户已删除</span>' : ''}</td>
     <td class="nowrap">${escapeHtml(r.device_id || '-')}</td>
@@ -2911,46 +3538,29 @@ async function adminSerialsPage(request, env, url) {
   </tr>`).join('');
 
   return html(`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>序列号发放 · ${escapeHtml(env.APP_NAME || '')}</title>
+<html lang="zh-CN"><head>${THEME_BOOT}<meta charset="utf-8"><title>序列号发放 · ${escapeHtml(env.APP_NAME || '')}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{margin:0;font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f2f4f7;color:#1f2937}
-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
-header a{color:#2563eb;text-decoration:none;font-size:14px}
+<style>${DARK}
+header{background:var(--header-bg);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:5}
+header a{font-size:14px}
 .wrap{padding:20px 24px;max-width:1280px;margin:0 auto}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
-th,td{padding:10px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;text-align:left;vertical-align:top}
-th{background:#fafafa;color:#6b7280;font-weight:500;white-space:nowrap}
 td.nowrap{white-space:nowrap}
-/* 版本名较长：允许在词间换行，别把 "BarTender" 从中间切开 */
 td.ver{white-space:normal;word-break:normal;overflow-wrap:break-word;min-width:150px;max-width:240px}
-.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px}
-.mono{font-family:Consolas,Menlo,monospace}
-.muted{color:#9ca3af;font-size:12px}
-.tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px}
-.tag.ok{background:#e6f7ee;color:#1a7f4b}
-.tag.ban{background:#fdecea;color:#b3261e}
-.tag.wait{background:#fff4e5;color:#8a5a00}
-.tag.normal{background:#f2f4f7;color:#6b7280}
-.tag.hidden{background:#fff4e5;color:#8a5a00;border:1px solid #ffe3b8}
-.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center}
-.toolbar input{padding:8px 10px;border:1px solid #e5e7eb;border-radius:6px;width:280px}
-.toolbar button{padding:8px 14px;border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer}
-.cost-setting{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;gap:8px;align-items:center}
-.cost-setting label{font-size:13px;color:#374151;white-space:nowrap}
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:12px}
+.tag.hidden{background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn-bg)}
+.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.toolbar input{padding:8px 10px;border-radius:8px;width:280px}
+.cost-setting{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;gap:8px;align-items:center;display:flex;flex-wrap:wrap}
+.cost-setting label{font-size:13px;color:var(--fg);white-space:nowrap}
 .cost-setting input{width:90px !important}
 .cost-setting .muted{margin-left:4px}
 .tabs{display:flex;gap:6px}
-.tabs a{padding:6px 12px;border:1px solid #e5e7eb;background:#fff;border-radius:8px;font-size:13px;text-decoration:none;color:#1f2937}
-.tabs a.on{background:#eff4ff;border-color:#2563eb;color:#2563eb;font-weight:600}
+.tabs a{padding:6px 12px;border:1px solid var(--line2);background:var(--panel);border-radius:8px;font-size:13px;color:var(--muted)}
+.tabs a.on{background:rgba(56,189,248,.15);border-color:var(--brand);color:var(--brand);font-weight:600}
 form.inline{display:inline}
-button.mini{padding:4px 10px;font-size:12px;border-radius:6px;border:1px solid #2563eb;
-  background:#eff4ff;color:#2563eb;cursor:pointer;margin:0 4px 4px 0}
-button.mini.danger{border-color:#e5b4b0;background:#fdeeec;color:#b3261e}
-.msg{background:#e8f5ec;color:#1a7f4b;border:1px solid #bfe6d1;padding:10px 14px;border-radius:8px;margin-bottom:12px}
-.tip{color:#6b7280;font-size:12px;line-height:1.7;margin-top:12px}
-.pager{margin-top:12px;display:flex;gap:8px;justify-content:flex-end;color:#6b7280;font-size:13px;align-items:center}
-.pager a{padding:6px 12px;border:1px solid #e5e7eb;background:#fff;border-radius:6px;text-decoration:none;color:#1f2937}
+button.mini{padding:4px 10px;font-size:12px;border-radius:6px;border:1px solid rgba(56,189,248,.4);background:rgba(56,189,248,.1);color:var(--brand);cursor:pointer;margin:0 4px 4px 0}
+button.mini.danger{border-color:var(--err-bg);background:var(--err-bg);color:var(--err)}
+.tip{color:var(--muted);font-size:12px;line-height:1.7;margin-top:12px}
 </style></head><body>
 <header>
   <a href="/${adminPrefix}">← 返回用户列表</a>
@@ -2973,7 +3583,7 @@ button.mini.danger{border-color:#e5b4b0;background:#fdeeec;color:#b3261e}
     <th>序列号</th><th>版本</th><th>分类</th><th>用户</th><th>手机号</th><th>来源</th>
     <th>领取时间</th><th>状态</th><th>设备ID</th><th>激活时间</th><th>操作</th>
   </tr></thead>
-  <tbody>${trs || '<tr><td colspan="11" style="text-align:center;color:#6b7280;padding:24px">还没有人领取序列号</td></tr>'}</tbody></table></div>
+  <tbody>${trs || '<tr><td colspan="11" style="text-align:center;color:var(--muted);padding:24px">还没有人领取序列号</td></tr>'}</tbody></table></div>
   <div class="tip">
     删除会先同步「序列号后台」再删本地记录，两边保持一致：<br>
     · <b>删除·退回池</b>：号回到可发放池，<b>该用户的首免额度同时释放</b>，他可以重新走一遍取号流程；<br>
@@ -3055,14 +3665,14 @@ async function adminCodesPage(request, env, url) {
   const pageVal = String(page);
   const searchVal = escapeHtml(search);
 
-  const trs = list.map((r) => `<tr${Number(r.hidden || 0) === 1 ? ' style="background:#fffdf6"' : ''}>
+  const trs = list.map((r) => `<tr${Number(r.hidden || 0) === 1 ? ' style="background:rgba(210,153,34,.07)"' : ''}>
     <td class="nowrap">${fmtBeijing(r.created_at)}</td>
     <td class="mono nowrap"><b>${escapeHtml(r.code)}</b></td>
     <td class="mono nowrap">key:${escapeHtml(r.code)}</td>
     <td class="mono nowrap">${escapeHtml(r.mac)}</td>
     <td class="nowrap">${r.user_id}<br><span class="muted">${escapeHtml(r.nickname || '')}</span>${Number(r.hidden || 0) === 1 ? ' <span class="tag hidden">用户已删除</span>' : ''}</td>
     <td class="nowrap">${escapeHtml(r.phone || '-')}</td>
-    <td class="nowrap">${Number(r.cost || 0)} 个愿望</td>
+    <td class="nowrap">${Number(r.cost || 0) > 0 ? (Number(r.cost || 0) / 100).toFixed(2) + ' 元' : '免费'}</td>
     <td class="nowrap">
       <form method="post" action="/${adminPrefix}/codes/delete" class="inline"
         onsubmit="return confirm('删除这条验证码记录？\\n${escapeHtml(r.mac)} → ${escapeHtml(r.code)}\\n（只删记录，不退还已扣的愿望）')">
@@ -3075,37 +3685,26 @@ async function adminCodesPage(request, env, url) {
   </tr>`).join('');
 
   return html(`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>插座验证码 · ${escapeHtml(env.APP_NAME || '')}</title>
+<html lang="zh-CN"><head>${THEME_BOOT}<meta charset="utf-8"><title>插座验证码 · ${escapeHtml(env.APP_NAME || '')}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{margin:0;font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f2f4f7;color:#1f2937}
-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
-header a{color:#2563eb;text-decoration:none;font-size:14px}
+<style>${DARK}
+header{background:var(--header-bg);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header a{font-size:14px}
 .wrap{padding:20px 24px;max-width:1240px;margin:0 auto}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
-th,td{padding:10px 10px;border-bottom:1px solid #e5e7eb;font-size:13px;text-align:left;vertical-align:top}
-th{background:#fafafa;color:#6b7280;font-weight:500;white-space:nowrap}
 td.nowrap{white-space:nowrap}
-.mono{font-family:Consolas,Menlo,monospace}
-.muted{color:#9ca3af;font-size:12px}
-.tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;line-height:1.5}
-.tag.hidden{background:#fff4e5;color:#8a5a00;border:1px solid #ffe3b8}
-.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center}
-.toolbar input{padding:8px 10px;border:1px solid #e5e7eb;border-radius:6px;width:300px}
-.toolbar button{padding:8px 14px;border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:6px;cursor:pointer}
-.cost-setting{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;gap:8px;align-items:center}
-.cost-setting label{font-size:13px;color:#374151;white-space:nowrap}
+.tag.hidden{background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn-bg)}
+.toolbar{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.toolbar input{padding:8px 10px;border-radius:8px;width:300px}
+.cost-setting{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;gap:8px;align-items:center;display:flex;flex-wrap:wrap}
+.cost-setting label{font-size:13px;color:var(--fg);white-space:nowrap}
 .cost-setting input{width:90px !important}
 .cost-setting .muted{margin-left:4px}
 .tabs{display:flex;gap:6px}
-.tabs a{padding:6px 12px;border:1px solid #e5e7eb;background:#fff;border-radius:8px;font-size:13px;text-decoration:none;color:#1f2937}
-.tabs a.on{background:#eff4ff;border-color:#2563eb;color:#2563eb;font-weight:600}
+.tabs a{padding:6px 12px;border:1px solid var(--line2);background:var(--panel);border-radius:8px;font-size:13px;color:var(--muted)}
+.tabs a.on{background:rgba(56,189,248,.15);border-color:var(--brand);color:var(--brand);font-weight:600}
 form.inline{display:inline}
-button.mini{padding:4px 12px;font-size:12px;border-radius:6px;border:1px solid #e5b4b0;background:#fdeeec;color:#b3261e;cursor:pointer}
-.msg{background:#e8f5ec;color:#1a7f4b;border:1px solid #bfe6d1;padding:10px 14px;border-radius:8px;margin-bottom:12px}
-.tip{color:#6b7280;font-size:12px;line-height:1.8;margin-top:12px}
-.pager{margin-top:12px;display:flex;gap:8px;justify-content:flex-end;color:#6b7280;font-size:13px;align-items:center}
-.pager a{padding:6px 12px;border:1px solid #e5e7eb;background:#fff;border-radius:6px;text-decoration:none;color:#1f2937}
+button.mini{padding:4px 12px;font-size:12px;border-radius:6px;border:1px solid var(--err-bg);background:var(--err-bg);color:var(--err);cursor:pointer}
+.tip{color:var(--muted);font-size:12px;line-height:1.8;margin-top:12px}
 </style></head><body>
 <header>
   <a href="/${adminPrefix}">← 返回用户列表</a>
@@ -3125,14 +3724,14 @@ button.mini{padding:4px 12px;font-size:12px;border-radius:6px;border:1px solid #
     ${search ? `<a href="?">清空</a>` : ''}
   </form>
   <table><thead><tr>
-    <th>生成时间</th><th>验证码</th><th>远程指令</th><th>设备MAC</th><th>用户</th><th>手机号</th><th>扣愿望</th><th>操作</th>
+    <th>生成时间</th><th>验证码</th><th>远程指令</th><th>设备MAC</th><th>用户</th><th>手机号</th><th>费用</th><th>操作</th>
   </tr></thead>
-  <tbody>${trs || '<tr><td colspan="8" style="text-align:center;color:#6b7280;padding:24px">还没有人生成过验证码</td></tr>'}</tbody></table>
+  <tbody>${trs || '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px">还没有人生成过验证码</td></tr>'}</tbody></table>
   <div class="tip">
     这是「智能插座验证码」的记录，和「标签软件序列号」是两个独立功能：<br>
-    · 当前每生成 1 个验证码扣 ${socketCostVal} 个愿望（消耗数量在「系统设置」里改）；上面「验证码」列就是 APP 里 key:XXXXXX 的 6 位数字；<br>
+    · 当前按个购买，单价见「系统设置 → 验证码价格档位」；上面「验证码」列就是 APP 里 key:XXXXXX 的 6 位数字；<br>
     · MAC 已统一成 12 位大写（去掉冒号），搜索时带不带冒号都可以；<br>
-    · <b>删除只删这条记录，不退还已扣的愿望</b>；验证码由 MAC + 固定盐值算出，删记录不影响设备继续用这个码。
+    · <b>删除只删这条记录，不退款</b>；验证码由 MAC + 固定盐值算出，删记录不影响设备继续用这个码。
   </div>
   <div class="pager">
     ${page > 1 ? `<a href="?page=${page - 1}${search ? '&search=' + encodeURIComponent(search) : ''}">上一页</a>` : ''}
@@ -3150,8 +3749,13 @@ async function adminLogsPage(request, env, url) {
   const page = Math.max(1, Number(url.searchParams.get('page') || 1));
   const offset = (page - 1) * pageSize;
 
+  // 按设备平台筛选：全部 / iOS / 安卓 / 其他（PC、开发者工具等）
+  const platform = ['ios', 'android', 'other'].includes(String(url.searchParams.get('platform') || ''))
+    ? String(url.searchParams.get('platform')) : '';
+  const qs = (p, extra) => '?page=' + p + (platform ? '&platform=' + platform : '') + (extra || '');
+
   // SQLite 分页：多取 1 条判断是否还有下一页
-  const rows = await __db.listLogs(pageSize + 1, offset);
+  const rows = await __db.listLogs(pageSize + 1, offset, platform);
   const hasMore = rows.length > pageSize;
   const logs = rows.slice(0, pageSize);
 
@@ -3162,31 +3766,147 @@ async function adminLogsPage(request, env, url) {
     <td>${escapeHtml(l.action)}</td>
     <td>${escapeHtml(l.detail||'')}</td>
     <td>${escapeHtml(l.nickname || l.openid || '-')}</td>
+    <td class="dev">${escapeHtml(l.device||'')}</td>
     <td>${escapeHtml(l.ip||'')}</td>
   </tr>`).join('');
 
+  const chip = (val, label) => `<a class="chip${platform === val ? ' on' : ''}" href="?page=1${val ? '&platform=' + val : ''}">${label}</a>`;
+
   return html(`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>审计日志 · ${escapeHtml(env.APP_NAME||'')}</title>
-<style>
-body{margin:0;font-family:-apple-system,"Microsoft YaHei",sans-serif;background:#f2f4f7;color:#1f2937}
-header{background:#fff;border-bottom:1px solid #e5e7eb;padding:14px 24px}
-header a{color:#2563eb;text-decoration:none;font-size:14px}
-.wrap{padding:20px 24px;max-width:1100px;margin:0 auto}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
-th,td{padding:10px 12px;border-bottom:1px solid #e5e7eb;font-size:13px;text-align:left}
-th{background:#fafafa;color:#6b7280;font-weight:500}
-.pager{margin-top:12px;display:flex;gap:8px;justify-content:flex-end;color:#6b7280;font-size:13px}
-.pager a{padding:6px 12px;border:1px solid #e5e7eb;background:#fff;border-radius:6px;text-decoration:none;color:#1f2937}
+<html lang="zh-CN"><head>${THEME_BOOT}<meta charset="utf-8"><title>审计日志 · ${escapeHtml(env.APP_NAME||'')}</title>
+<style>${DARK}
+header{background:var(--header-bg);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:14px 24px;position:sticky;top:0;z-index:5}
+header a{font-size:14px}
+.wrap{padding:20px 24px;max-width:1240px;margin:0 auto}
+h2{font-size:16px;color:var(--fg);margin:0 0 14px}
+.filters{display:flex;gap:8px;margin:0 0 12px}
+.chip{font-size:13px;padding:4px 12px;border:1px solid var(--line);border-radius:14px;color:var(--muted);text-decoration:none}
+.chip.on{background:var(--header-bg);color:var(--fg);border-color:var(--fg)}
+td.dev{font-size:12px;color:var(--muted);max-width:280px;word-break:break-all}
+.hint{font-size:12px;color:var(--muted);margin:10px 0 0}
+/* ── 排版：标题行 / 表格横向滚动 / 列宽与换行 ── */
+.row-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 14px}
+.row-head h2{margin:0}
+.layout-btn{font-size:13px;padding:6px 14px;border:1px solid var(--line2);background:var(--panel);color:var(--fg);border-radius:10px;cursor:pointer;white-space:nowrap}
+.layout-btn:hover{border-color:var(--brand);color:var(--brand)}
+.tbl-scroll{overflow-x:auto;border-radius:12px}
+#log-table{min-width:640px}
+#log-table th,#log-table td{vertical-align:top}
+#log-table td.nowrap-cell{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+#log-table td.wrap-cell{white-space:normal;word-break:break-word;overflow-wrap:break-word}
+/* 排版抽屉面板 */
+.lay-mask{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:50}
+.lay-mask.show{display:block}
+.lay-panel{position:fixed;top:0;right:0;height:100%;width:320px;max-width:88vw;background:var(--panel);border-left:1px solid var(--line2);box-shadow:-12px 0 32px rgba(0,0,0,.3);display:none;flex-direction:column;z-index:51}
+.lay-panel.show{display:flex}
+.lay-panel-head{padding:16px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between}
+.lay-panel-head b{font-size:15px;color:var(--fg)}
+.lay-close{background:none;border:0;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
+.lay-body{flex:1;overflow:auto;padding:14px 18px}
+.lay-col{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px dashed var(--line)}
+.lay-col-name{width:64px;font-size:13px;color:var(--fg);flex-shrink:0}
+.lay-col label{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;white-space:nowrap;cursor:pointer}
+.lay-col input[type=number]{width:64px;padding:5px 6px;font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--fg)}
+.lay-col input[type=number]:disabled{opacity:.4}
+.lay-foot{padding:14px 18px;border-top:1px solid var(--line);display:flex;gap:8px}
+.lay-foot button{flex:1;padding:9px 0;font-size:13px;border-radius:10px;cursor:pointer;border:1px solid var(--line2);background:var(--panel2);color:var(--fg)}
+.lay-foot .primary{background:var(--brand2,#2b6cff);color:#fff;border-color:transparent}
 </style></head><body>
 <header><a href="/${adminPrefix}">← 返回用户列表</a></header>
 <div class="wrap">
-<h2>审计日志（第 ${page} 页）</h2>
-<table><thead><tr><th>用户ID</th><th>时间</th><th>动作</th><th>详情</th><th>用户</th><th>IP</th></tr></thead>
-<tbody>${trs || '<tr><td colspan="6" style="text-align:center;color:#6b7280;padding:20px">暂无日志</td></tr>'}</tbody></table>
+<div class="row-head"><h2>审计日志（第 ${page} 页）</h2><button type="button" class="layout-btn" id="btn-layout">⚙ 排版</button></div>
+<div class="filters">${chip('', '全部')}${chip('ios', 'iOS')}${chip('android', '安卓')}${chip('other', '其他 / PC')}</div>
+<div class="tbl-scroll">
+<table id="log-table"><thead><tr><th data-col="0">用户ID</th><th data-col="1">时间</th><th data-col="2">动作</th><th data-col="3">详情</th><th data-col="4">用户</th><th data-col="5">设备</th><th data-col="6">IP</th></tr></thead>
+<tbody>${trs || '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:20px">暂无日志</td></tr>'}</tbody></table>
+</div>
 <div class="pager">
-  ${page>1 ? `<a href="?page=${page-1}">上一页</a>` : ''}
-  ${hasMore ? `<a href="?page=${page+1}">下一页</a>` : ''}
-</div></div></body></html>`);
+  ${page>1 ? `<a href="${qs(page-1)}">上一页</a>` : ''}
+  ${hasMore ? `<a href="${qs(page+1)}">下一页</a>` : ''}
+</div>
+<div class="hint">设备列格式：平台|厂商|机型|系统|微信版本|基础库|屏幕，如 <code>ios|iPhone|iPhone 15 Pro&lt;iPhone15,3&gt;|iOS 17.2.1|wx8.0.68|sdk3.5.0|393x852</code>。升级前的历史日志没有设备信息，显示为空。</div>
+</div>
+
+<!-- 排版面板（列换行开关 + 列宽，localStorage 持久化） -->
+<div class="lay-mask" id="lay-mask"></div>
+<aside class="lay-panel" id="lay-panel">
+  <div class="lay-panel-head"><b>表格排版</b><button type="button" class="lay-close" id="lay-close">×</button></div>
+  <div class="lay-body" id="lay-body"></div>
+  <div class="lay-foot"><button type="button" id="lay-reset">恢复默认</button><button type="button" class="primary" id="lay-done">完成</button></div>
+</aside>
+<script>
+(function(){
+  var KEY='logs-layout-v1';
+  var DEFAULTS=[
+    {name:'用户ID',wrap:true,w:58},
+    {name:'时间',wrap:true,w:76},
+    {name:'动作',wrap:true,w:64},
+    {name:'详情',wrap:true,w:81},
+    {name:'用户',wrap:true,w:120},
+    {name:'设备',wrap:true,w:181},
+    {name:'IP',wrap:true,w:174}
+  ];
+  function fresh(){return DEFAULTS.map(function(d){return {wrap:d.wrap,w:d.w};});}
+  var cfg=fresh();
+  try{
+    var s=localStorage.getItem(KEY);
+    if(s){var d=JSON.parse(s); if(Array.isArray(d)&&d.length===DEFAULTS.length){cfg=d;}}
+  }catch(e){}
+  function save(){try{localStorage.setItem(KEY,JSON.stringify(cfg));}catch(e){}}
+  function apply(){
+    var table=document.getElementById('log-table'); if(!table)return;
+    table.style.tableLayout='fixed';
+    var heads=table.tHead.rows[0].cells;
+    var rows=table.tBodies[0].rows;
+    cfg.forEach(function(c,i){
+      if(heads[i])heads[i].style.width=c.w+'px';
+      for(var r=0;r<rows.length;r++){
+        var td=rows[r].cells[i]; if(!td)continue;
+        td.style.width=c.w+'px';
+        td.classList.remove('wrap-cell','nowrap-cell');
+        td.classList.add(c.wrap?'wrap-cell':'nowrap-cell');
+      }
+    });
+  }
+  var body=document.getElementById('lay-body');
+  function renderPanel(){
+    body.innerHTML='';
+    cfg.forEach(function(c,i){
+      var widthInput=document.createElement('input');
+      widthInput.type='number'; widthInput.min='40'; widthInput.value=c.w;
+      widthInput.disabled=!c.wrap;
+      widthInput.oninput=function(){
+        var v=parseInt(widthInput.value,10);
+        if(v>=40){cfg[i].w=v;save();apply();}
+      };
+      var chk=document.createElement('input'); chk.type='checkbox'; chk.checked=!!c.wrap;
+      chk.onchange=function(){
+        cfg[i].wrap=chk.checked; widthInput.disabled=!chk.checked; save(); apply();
+      };
+      var row=document.createElement('div'); row.className='lay-col';
+      var name=document.createElement('span'); name.className='lay-col-name'; name.textContent=c.name;
+      var lab=document.createElement('label');
+      var labText=document.createElement('span'); labText.textContent='换行';
+      lab.appendChild(chk); lab.appendChild(labText);
+      var px=document.createElement('span'); px.style.cssText='font-size:12px;color:var(--muted)'; px.textContent='px';
+      row.appendChild(name); row.appendChild(lab); row.appendChild(widthInput); row.appendChild(px);
+      body.appendChild(row);
+    });
+  }
+  var mask=document.getElementById('lay-mask'),panel=document.getElementById('lay-panel');
+  function openPanel(){renderPanel();mask.classList.add('show');panel.classList.add('show');}
+  function closePanel(){mask.classList.remove('show');panel.classList.remove('show');}
+  document.getElementById('btn-layout').onclick=openPanel;
+  document.getElementById('lay-close').onclick=closePanel;
+  mask.onclick=closePanel;
+  document.getElementById('lay-done').onclick=closePanel;
+  document.getElementById('lay-reset').onclick=function(){
+    cfg=fresh(); save(); apply(); renderPanel();
+  };
+  apply();
+})();
+</script>
+</body></html>`);
 }
 
 // ───────────────────────── Admin 首页 ─────────────────────────
@@ -3197,65 +3917,47 @@ function renderAdminPage(env) {
   const mock = isMock(env);
   const xpayReady = !!(env.XPAY_OFFER_ID && env.XPAY_APP_KEY);
   return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="zh-CN"><head>${THEME_BOOT}<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} · 后台</title>
-<style>
-:root{--bd:#e5e7eb;--bg:#f2f4f7;--fg:#1f2937;--muted:#6b7280;--brand:#2563eb}
-*{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
-header{background:#fff;border-bottom:1px solid var(--bd);padding:14px 24px;display:flex;align-items:center;justify-content:space-between}
-header h1{font-size:17px;margin:0}
-header a{color:var(--muted);text-decoration:none;font-size:13px;margin-left:16px}
+<style>${DARK}
+header{background:var(--header-bg);backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:5}
+header h1{font-size:17px;margin:0;color:var(--fg)}
+header a{color:var(--muted);font-size:13px;margin-left:16px}
+header a:hover{color:var(--brand)}
 .wrap{padding:20px 24px;max-width:1320px;margin:0 auto}
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:18px}
-.stat{background:#fff;border:1px solid var(--bd);border-radius:10px;padding:16px}
-.stat b{font-size:22px;display:block}
+.stat{background:linear-gradient(160deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:14px;padding:18px 16px;transition:.2s}
+.stat:hover{border-color:var(--line2);transform:translateY(-2px)}
+.stat b{font-size:24px;display:block;color:var(--brand);font-weight:700}
 .stat span{color:var(--muted);font-size:12px}
 .tabs{display:flex;gap:8px;margin-bottom:14px}
-.tabs button{padding:8px 16px;border:1px solid var(--bd);background:#fff;border-radius:8px;cursor:pointer;font-size:14px}
-.tabs button.on{background:var(--brand);color:#fff;border-color:var(--brand)}
-.toolbar{background:#fff;border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:14px;display:flex;gap:10px;align-items:center}
-.toolbar input{padding:8px 10px;border:1px solid var(--bd);border-radius:8px;font-size:14px;flex:1;max-width:360px}
-.toolbar button{padding:8px 16px;background:var(--brand);color:#fff;border:0;border-radius:8px;cursor:pointer}
-.toolbar button.danger{background:#dc2626}
-.toolbar button:disabled{background:#cbd5e1;cursor:not-allowed}
-.row-del{color:#dc2626;background:none;border:0;cursor:pointer;font-size:13px;padding:4px 6px}
-.sel-chk{width:16px;height:16px;cursor:pointer;vertical-align:middle}
-table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--bd);border-radius:10px;overflow:hidden}
-th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--bd);font-size:13px;vertical-align:middle}
-th{background:#fafafa;color:var(--muted);font-weight:500}
-tr:hover td{background:#f9fafb}
-.tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px}
-.tag.vip{background:#fef3c7;color:#92400e}
-.tag.diamond{background:#e0e7ff;color:#3730a3}
-.tag.normal{background:#f3f4f6;color:#374151}
-.tag.ban{background:#fee2e2;color:#991b1b}
-.tag.mock{background:#fef9c3;color:#854d0e}
-.tag.ok{background:#dcfce7;color:#166534}
-.tag.wait{background:#f3f4f6;color:#6b7280}
-.idn{font-weight:600;color:#1f2937}
-.money{font-weight:600;color:#0f766e}
-.muted{color:var(--muted);font-size:12px}
-.mono{font-family:Menlo,Consolas,monospace;font-size:12px;color:var(--muted)}
-.pager{margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:flex-end;color:var(--muted);font-size:13px}
-.pager button{padding:6px 12px;border:1px solid var(--bd);background:#fff;border-radius:6px;cursor:pointer}
-.mask{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:9}
+.tabs button{padding:8px 18px;border:1px solid var(--line2);background:var(--panel);color:var(--muted);border-radius:10px;cursor:pointer;font-size:14px}
+.tabs button.on{background:var(--brand2);color:#fff;border-color:var(--brand2)}
+.toolbar{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.toolbar input{padding:8px 10px;font-size:14px;flex:1;min-width:200px;max-width:360px}
+.toolbar button{padding:8px 16px}
+.toolbar button.danger{background:var(--err)}
+.toolbar button:disabled{background:var(--line2);color:var(--muted);cursor:not-allowed;filter:none}
+.row-del{color:var(--err);background:none;border:0;cursor:pointer;font-size:13px;padding:4px 6px}
+.row-del:hover{text-decoration:underline}
+.sel-chk{width:16px;height:16px;cursor:pointer;vertical-align:middle;accent-color:var(--brand)}
+.idn{font-weight:600;color:var(--fg)}
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:9}
 .mask.show{display:flex}
-.dialog{background:#fff;border-radius:12px;padding:22px;width:520px;max-width:94vw;max-height:92vh;overflow:auto}
-.dialog h2{margin:0 0 14px;font-size:16px}
+.dialog{background:var(--panel);border:1px solid var(--line2);border-radius:14px;padding:22px;width:520px;max-width:94vw;max-height:92vh;overflow:auto;box-shadow:0 20px 60px rgba(15,23,42,.25)}
+.dialog h2{margin:0 0 14px;font-size:16px;color:var(--fg)}
 .dialog label{display:block;font-size:12px;color:var(--muted);margin:8px 0 4px}
-.dialog input,.dialog select{width:100%;padding:8px 10px;border:1px solid var(--bd);border-radius:8px;font-size:14px}
+.dialog input,.dialog select{width:100%;padding:8px 10px;font-size:14px}
 .dialog .row{display:flex;gap:10px}
 .dialog .row>div{flex:1}
 .dialog .btns{margin-top:16px;display:flex;justify-content:flex-end;gap:8px}
-.dialog .btns button{padding:8px 16px;border-radius:8px;border:1px solid var(--bd);background:#fff;cursor:pointer}
-.dialog .btns .primary{background:var(--brand);color:#fff;border-color:var(--brand)}
-.notice{background:#fef9c3;border:1px solid #fde047;color:#854d0e;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px}
-.warn{background:#fee2e2;border:1px solid #fca5a5;color:#991b1b;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px}
-.hint{background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px;line-height:1.7}
-.hint code{background:#dbeafe;padding:1px 6px;border-radius:4px;font-family:Menlo,Consolas,monospace}
-@media(max-width:960px){.stats{grid-template-columns:repeat(2,1fr)}th.hide,td.hide{display:none}}
+.dialog .btns button{padding:8px 16px;border-radius:8px;border:1px solid var(--line2);background:var(--panel2);color:var(--fg);cursor:pointer}
+.dialog .btns .primary{background:var(--brand2);color:#fff;border-color:var(--brand2)}
+/* 表格横向滚动：窄屏不隐藏任何列，容器出滚动条左右滑动查看 */
+.table-scroll{overflow-x:auto;border-radius:12px}
+.table-scroll table{min-width:max-content;width:100%}
+@media(max-width:960px){.stats{grid-template-columns:repeat(2,1fr)}}
 </style></head><body>
 <header>
   <h1>${title} · 管理后台</h1>
@@ -3288,15 +3990,17 @@ tr:hover td{background:#f9fafb}
       <a href="${adminPrefix}/settings" style="font-size:13px;color:var(--brand);text-decoration:none;margin-left:14px">系统设置</a>
       <a href="${adminPrefix}/logs" style="font-size:13px;color:var(--brand);text-decoration:none;margin-left:14px">审计日志</a>
     </div>
+    <div class="table-scroll">
     <table>
       <thead><tr>
         <th style="width:36px"><input type="checkbox" class="sel-chk" id="chk-all" onchange="toggleAll(this)"></th>
         <th>用户ID</th><th>昵称 / openid</th><th class="hide">手机号</th>
-        <th>愿望</th><th>已领号</th><th>插座key</th><th>邀请人</th><th>已邀请</th><th class="hide">累计购买</th><th class="hide">累计消费</th>
+        <th>免费取号</th><th>已领号</th><th>插座key</th><th>邀请人</th><th>已邀请</th><th class="hide">免费验证码</th><th class="hide">累计消费</th>
         <th>状态</th><th class="hide">注册时间</th><th>操作</th>
       </tr></thead>
       <tbody id="tb"><tr><td colspan="14" class="muted" style="text-align:center;padding:24px">加载中…</td></tr></tbody>
     </table>
+    </div>
     <div class="pager">
       <span id="pageinfo"></span>
       <button onclick="load(page-1)">上一页</button>
@@ -3305,13 +4009,15 @@ tr:hover td{background:#f9fafb}
   </div>
 
   <div id="pane-orders" style="display:none">
+    <div class="table-scroll">
     <table>
       <thead><tr>
-        <th>业务单号</th><th>用户ID</th><th>道具</th><th>金额</th><th>次数</th>
-        <th>状态</th><th class="hide">平台单号</th><th class="hide">创建时间</th>
+        <th>业务单号</th><th>用户ID</th><th>类型</th><th>道具</th><th>金额</th><th>数量</th>
+        <th>发货结果</th><th>状态</th><th class="hide">平台单号</th><th class="hide">创建时间</th><th>操作</th>
       </tr></thead>
-      <tbody id="tb-orders"><tr><td colspan="8" class="muted" style="text-align:center;padding:24px">加载中…</td></tr></tbody>
+      <tbody id="tb-orders"><tr><td colspan="11" class="muted" style="text-align:center;padding:24px">加载中…</td></tr></tbody>
     </table>
+    </div>
     <div class="pager">
       <span id="pageinfo-orders"></span>
       <button onclick="loadOrders(pageOrders-1)">上一页</button>
@@ -3325,12 +4031,14 @@ tr:hover td{background:#f9fafb}
       否则支付会报 <code>-15010</code>（道具未发布）或 <code>-15013</code>（道具价格错误）。<br>
       改完记得在 MP 后台点「发布」，发布后约 10 分钟才生效（提前调用会报 <code>-15014</code>）。
     </div>
+    <div class="table-scroll">
     <table>
       <thead><tr>
         <th>道具ID (productId)</th><th>名称</th><th>价格(分)</th><th>购买数量</th><th>每次发放次数</th><th>排序</th><th>操作</th>
       </tr></thead>
       <tbody id="tb-products"></tbody>
     </table>
+    </div>
     <div class="toolbar" style="margin-top:14px">
       <button onclick="addProduct()">+ 新增道具</button>
       <button onclick="useDefaultProducts()" title="把上表的默认档位填进编辑器，仍需点保存">载入默认档位</button>
@@ -3349,18 +4057,19 @@ tr:hover td{background:#f9fafb}
   <div class="row">
     <div><label>次数操作</label>
       <select id="e-count-mode">
-        <option value="set">设为指定次数</option>
-        <option value="add">增加次数</option>
+        <option value="set">设为指定值</option>
+        <option value="add">增加</option>
       </select></div>
-    <div><label>次数</label><input id="e-count" type="number" min="0" step="1" placeholder="如 5"></div>
+    <div><label>免费取号次数</label><input id="e-free-serial" type="number" min="0" step="1" placeholder="如 2"></div>
+    <div><label>免费验证码次数</label><input id="e-free-socket" type="number" min="0" step="1" placeholder="如 1"></div>
   </div>
-  <div class="muted" style="margin-top:6px">当前剩余：<b id="e-count-cur">0</b> 次（此处为剩余愿望余额，与顶部"有效用户"口径不同）</div>
+  <div class="muted" style="margin-top:6px">当前：免费取号 <b id="e-free-serial-cur">0</b> 次 · 免费验证码 <b id="e-free-socket-cur">0</b> 次（邀请好友获得，不是余额）</div>
 
   <div class="row" style="margin-top:10px">
-    <div><label>累计购买次数（留空=不改，填 0=清零）</label><input id="e-total" type="number" min="0" step="1" placeholder="次数"></div>
     <div><label>累计消费（元，留空=不改，填 0=清零）</label><input id="e-spent" type="number" min="0" step="0.01" placeholder="元"></div>
+    <div><label>VIP 等级（由累计消费自动算，只读）</label><input id="e-level" readonly></div>
   </div>
-  <div class="muted" style="margin-top:6px">当前：累计购买 <b id="e-total-cur">0</b> 次 · 累计消费 <b id="e-spent-cur">0.00</b> 元</div>
+  <div class="muted" style="margin-top:6px">当前：累计消费 <b id="e-spent-cur">0.00</b> 元 · 等级 <b id="e-level-cur">VIP</b></div>
   <label>状态</label>
   <select id="e-status"><option value="0">正常</option><option value="1">封禁</option></select>
   <label>备注</label><input id="e-remark">
@@ -3419,9 +4128,9 @@ async function load(p){
   if(!allUsers.length){ tb.innerHTML = '<tr><td colspan="14" class="muted" style="text-align:center;padding:24px">无数据</td></tr>'; syncSelUI(); return; }
   tb.innerHTML = allUsers.map(u=>{
     const tag = u.status==1 ? '<span class="tag ban">已封禁</span>'
-              : u.count>0 ? '<span class="tag vip">有余额</span>'
-              : '<span class="tag normal">普通</span>';
-    const reg = fmtBj(u.created_at, true);
+              : (u.free_serial>0 || u.free_socket>0) ? '<span class="tag vip">有免费次数</span>'
+              : '<span class="tag normal">VIP</span>';
+    const reg = fmtBj(u.created_at);
     const checked = selectedIds.has(u.id) ? 'checked' : '';
     return '<tr>'
       +'<td><input type="checkbox" class="sel-chk" '+checked+' onchange="toggleOne('+u.id+', this.checked)"></td>'
@@ -3429,14 +4138,14 @@ async function load(p){
       +'<td>'+(u.nickname||'<span class=muted>未设置</span>')
       +'<br><span class="mono">'+u.openid.slice(-8)+'</span></td>'
       +'<td class="hide">'+(u.phone||'-')+'</td>'
-      +'<td class="money">'+u.count+'</td>'
+      +'<td class="money">'+(u.free_serial||0)+'</td>'
       +'<td>'+(u.serials||0)+'</td>'
       +'<td>'+(u.codes||0)+'</td>'
       +'<td>'+(u.invited_by ? '← '+u.invited_by : '<span class=muted>-</span>')+'</td>'
       +'<td>'+(u.invites||0)+'</td>'
-      +'<td class="hide">'+u.total+'</td>'
+      +'<td class="hide">'+(u.free_socket||0)+'</td>'
       +'<td class="hide">'+u.spent+'</td>'
-      +'<td>'+tag+'</td>'
+      +'<td>'+(u.level_name||'VIP')+'<br>'+tag+'</td>'
       +'<td class="hide">'+reg+'</td>'
       +'<td><button onclick="openDlgById('+u.id+')">编辑</button> '
       +'<button class="row-del" onclick="deleteOne('+u.id+')">删除</button></td></tr>';
@@ -3450,23 +4159,48 @@ async function loadOrders(p){
   document.getElementById('pageinfo-orders').textContent = '第 '+pageOrders+' 页，共 '+r.total+' 条';
   const tb = document.getElementById('tb-orders');
   const list = r.orders || [];
-  if(!list.length){ tb.innerHTML = '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">暂无订单</td></tr>'; return; }
+  if(!list.length){ tb.innerHTML = '<tr><td colspan="11" class="muted" style="text-align:center;padding:24px">暂无订单</td></tr>'; return; }
   const stTag = s => s==='delivered' ? '<span class="tag ok">已发货</span>'
     : s==='pending' ? '<span class="tag wait">待支付</span>'
-    : s==='paid_no_goods' ? '<span class="tag ban">待人工补发</span>'
+    : s==='paid_no_goods' ? '<span class="tag ban">待补发</span>'
     : '<span class="tag normal">'+s+'</span>';
+  const dsTag = s => s==='issued' ? '<span class="tag ok">已发</span>'
+    : s==='failed' ? '<span class="tag ban">失败</span>'
+    : '<span class="tag wait">待发</span>';
+  const kindText = k => k==='serial' ? '取号' : (k==='socket' ? '验证码' : '历史单');
   tb.innerHTML = list.map(o=>{
     const ct = fmtBj(o.createdAt);
+    let result = '';
+    try {
+      const R = o.result ? JSON.parse(o.result) : null;
+      if (R && R.serial) result = '<span class="mono">' + R.serial + '</span>';
+      else if (R && R.codes) result = (R.codes.length) + ' 个码';
+    } catch (e) {}
+    const canRetry = o.status !== 'delivered';
     return '<tr>'
       +'<td class="mono">'+o.outTradeNo+(o.mock?' <span class="tag mock">mock</span>':'')+'</td>'
       +'<td class="idn">'+o.userId+'</td>'
+      +'<td>'+kindText(o.kind)+'</td>'
       +'<td>'+o.productName+'<br><span class="mono">'+o.productId+'</span></td>'
       +'<td class="money">'+o.price+'</td>'
-      +'<td>'+o.times+'</td>'
-      +'<td>'+stTag(o.status)+'</td>'
+      +'<td>'+o.quantity+'</td>'
+      +'<td>'+result+(o.note?'<br><span class="muted">'+o.note+'</span>':'')+'</td>'
+      +'<td>'+stTag(o.status)+'<br>'+dsTag(o.deliver_status)+'</td>'
       +'<td class="hide mono">'+(o.wxOrderId||'-')+'</td>'
-      +'<td class="hide">'+ct+'</td></tr>';
+      +'<td class="hide">'+ct+'</td>'
+      +'<td>'+(canRetry?'<button data-id="'+o.id+'" onclick="redeliver(this)">重新发号</button>':'-')+'</td></tr>';
   }).join('');
+}
+
+async function redeliver(el){
+  const id = el && el.dataset ? el.dataset.id : '';
+  if(!id) return;
+  if(!confirm('重新给这笔订单发货？\\n会按订单类型重新发号 / 生成验证码，已发货的不会重复发。')) return;
+  const r = await fetch(ADMIN+'api/orders/redeliver',{
+    method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ order_id: id })
+  }).then(r=>r.json());
+  if(r.ok){ alert('发货成功（'+(r.order&&r.order.deliver_status||'issued')+'）'); loadOrders(pageOrders); }
+  else alert('发货失败：'+(r.error||r.message||JSON.stringify(r)));
 }
 
 async function loadProducts(){
@@ -3550,13 +4284,15 @@ function openDlg(u){
   document.getElementById('e-new-id').value = '';
   document.getElementById('e-nickname').value = u.nickname||'';
   document.getElementById('e-phone').value   = u.phone||'';
-  document.getElementById('e-count').value = '';
+  document.getElementById('e-free-serial').value = '';
+  document.getElementById('e-free-socket').value = '';
   document.getElementById('e-count-mode').value = 'set';
-  document.getElementById('e-count-cur').textContent = u.count||0;
-  // 累计购买 / 累计消费：留空=不改，填 0=清零，所以这里只展示当前值
-  document.getElementById('e-total').value = '';
+  document.getElementById('e-free-serial-cur').textContent = u.free_serial||0;
+  document.getElementById('e-free-socket-cur').textContent = u.free_socket||0;
+  // 累计消费：留空=不改，填 0=清零；会员等级由后端按累计消费算，这里只展示
   document.getElementById('e-spent').value = '';
-  document.getElementById('e-total-cur').textContent = u.total||0;
+  document.getElementById('e-level').value = u.level_name||'VIP';
+  document.getElementById('e-level-cur').textContent = u.level_name||'VIP';
   document.getElementById('e-spent-cur').textContent = u.spent||'0.00';
   document.getElementById('e-status').value  = u.status||0;
   document.getElementById('e-remark').value  = u.remark||'';
@@ -3571,14 +4307,14 @@ async function saveUser(){
     remark:   document.getElementById('e-remark').value,
     status:   document.getElementById('e-status').value
   };
-  const c = document.getElementById('e-count').value;
-  if (c !== '') {
-    body.count = c;
+  const fs = document.getElementById('e-free-serial').value;
+  const fk = document.getElementById('e-free-socket').value;
+  if (fs !== '' || fk !== '') {
+    if (fs !== '') body.free_serial = fs;
+    if (fk !== '') body.free_socket = fk;
     body.count_mode = document.getElementById('e-count-mode').value;
   }
   // 留空=不改；填了值（含 0）才提交
-  const t = document.getElementById('e-total').value;
-  if (t !== '') body.total = t;
   const s = document.getElementById('e-spent').value;
   if (s !== '') body.spent = s;
   // 用户ID：留空=不改，填了才提交（后端做唯一校验）

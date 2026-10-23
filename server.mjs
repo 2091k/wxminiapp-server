@@ -13,6 +13,7 @@
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { SQLiteDB } from './db.mjs';
+import { runWithRequest } from './meta.mjs';
 
 // ① 读取同目录 .env（若存在；已存在的真实环境变量优先，systemd EnvironmentFile 优先于 .env）
 //    只支持 `KEY=值` 和整行注释（# 开头）；不要在 = 后面写注释，会被当成值
@@ -54,6 +55,8 @@ const env = {
   XPAY_OFFER_ID: process.env.XPAY_OFFER_ID || '',
   XPAY_APP_KEY: process.env.XPAY_APP_KEY || '',
   XPAY_NOTIFY_SIGN_KEY: process.env.XPAY_NOTIFY_SIGN_KEY || '',
+  // 微信「消息推送」里的 Token(令牌)：GET 接入验证（echostr）用它算 sha1 签名
+  XPAY_NOTIFY_TOKEN: process.env.XPAY_NOTIFY_TOKEN || '',
   // 序列号后台（Cloudflare Worker）地址与令牌：取号时后端之间通信，小程序拿不到
   BTKEY_API_BASE: process.env.BTKEY_API_BASE || '',
   BTKEY_API_TOKEN: process.env.BTKEY_API_TOKEN || '',
@@ -75,7 +78,8 @@ http.createServer(async (req, res) => {
       init.body = req;       // Node IncomingMessage 是异步可迭代流，undici 可直接消费
       init.duplex = 'half';
     }
-    const resp = await worker.fetch(new Request(url, init), env);
+    // 审计日志：把本次 request 挂到异步上下文，db.addLog() 落库时取 X-Device-Info
+    const resp = await runWithRequest(req, () => worker.fetch(new Request(url, init), env));
     // set-cookie 在 Headers 迭代里会被逗号合并成一条导致后台登录失效，这里单独取出
     const headers = {};
     for (const [k, v] of resp.headers) headers[k] = v;

@@ -12,6 +12,8 @@ tags:
 
 # wxminiapp-server 部署运维完整教程
 
+项目地址[https://github.com/2091k/wxminiapp-server](https://github.com/2091k/wxminiapp-server)
+
 > 适用环境：Ubuntu 20.04+（aarch64 / x86_64）· Node.js 22.5+ · systemd
 > 本文档对应服务器路径：`/opt/wxminiapp-server`，服务地址 `http://<服务器IP>:8787`
 
@@ -183,7 +185,10 @@ WX_SECRET=小程序AppSecret，同页面，只显示一次
 # 虚拟支付（不填就只能用测试模式，不扣款）
 XPAY_OFFER_ID=虚拟支付OfferID，MP→虚拟支付→基础配置
 XPAY_APP_KEY=虚拟支付AppKey，同页面
-XPAY_NOTIFY_SIGN_KEY=支付回调验签Key
+# 微信「消息推送」里的 Token(令牌)，发货推送的接入验证要用（详见第十二节）
+XPAY_NOTIFY_TOKEN=自己定3-32位英文数字，必须与MP后台消息推送里的Token一字不差
+# 旧版可选的报文签名校验（只认请求头 x-signature），新版不需要，留空
+XPAY_NOTIFY_SIGN_KEY=
 
 # 序列号后台（Cloudflare Worker）
 # 生成 API_TOKEN（48 位，两边要填一样）：
@@ -194,7 +199,7 @@ SERIAL_CATEGORY=wxminiapp
 SERIAL_WISH_COST=每次取号扣多少愿望，留空=10
 EOF
 ```
-![](1.png)
+
 ### 5.2 生成随机密钥
 
 #### ① JWT_SECRET（后台登录签名用）
@@ -268,7 +273,8 @@ node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
 | `XPAY_MOCK` | ✅ | `1` = 测试模式（买什么都不扣钱，只用于自测）；**正式上线必须改成 `0`** |
 | `XPAY_OFFER_ID` | 真支付 | 虚拟支付 **OfferID**：微信公众平台 → 虚拟支付 → 基础配置 |
 | `XPAY_APP_KEY` | 真支付 | 虚拟支付 **AppKey**：同上页面（下单签名用） |
-| `XPAY_NOTIFY_SIGN_KEY` | 真支付 | 支付回调验签 key：虚拟支付 → 支付回调 / 消息推送里的签名密钥。填错=回调校验失败、订单不到账 |
+| `XPAY_NOTIFY_TOKEN` | 真支付 | 微信 **消息推送**里的 **Token(令牌)**：MP → 开发管理 → 消息推送 → Token。3–32 位英文/数字，必须与后台**一字不差**，否则接入验证失败（见第十二节） |
+| `XPAY_NOTIFY_SIGN_KEY` | 否 | 旧版可选：只对带 `x-signature` 请求头的报文做 HMAC 校验。新版微信推送不带这个头，**留空**即可；它**不是**消息推送里的 Token |
 
 > 只填 `XPAY_MOCK=1` 时，购买按钮可以走通但**不扣款**，适合提交审核前自测。
 
@@ -314,7 +320,8 @@ curl -s http://127.0.0.1:8787/health
 | 取号报「后台还没配置序列号服务」 | `BTKEY_API_BASE` / `BTKEY_API_TOKEN` 为空 | 填上 Worker 域名和 API_TOKEN |
 | 取号报 `401 unauthorized` | `BTKEY_API_TOKEN` 与 Worker 里的不一致 | 两边改成同一个值 |
 | 取号报 `out_of_stock` | 分类里没号了，或 `SERIAL_CATEGORY` 名字不对 | 后台导号；核对分类名（用 `check-deploy.mjs` 体检） |
-| 购买后没到账 | `XPAY_NOTIFY_SIGN_KEY` 错，回调验签失败 | 核对虚拟支付的签名密钥 |
+| 购买后没到账（订单一直 `pending`） | 微信「消息推送」没启用，或后台 Token 与 `XPAY_NOTIFY_TOKEN` 不一致 | 按第十二节配置；后台日志搜 `xpay_notify` |
+| 消息推送点「提交」报「服务器地址验证失败」 | 服务端不支持 GET `echostr` 验证，或 Token 没传进服务（server.mjs 白名单） | 升级 `src/index.js` + `server.mjs`，按 12.4 自检 |
 | 后台打不开 / 一直跳登录 | `ADMIN_PREFIX` 改了但访问路径没改 | 按新前缀访问，如 `/abc` |
 | 后台登录后立刻掉线 | `JWT_SECRET` 被改过（签发和校验不一致） | 固定 JWT_SECRET，改完所有人需重新登录 |
 
@@ -582,5 +589,145 @@ crontab -e
 
 ```bash
 # 重新上传 server.mjs / db.mjs / src/index.js 后：
-node --check src/index.js && systemctl restart wxminiapp
+cp src/index.js /tmp/check.mjs && node --check /tmp/check.mjs && systemctl restart wxminiapp
+```
+
+> `src/index.js` 是 ESM 语法但扩展名是 `.js`，直接 `node --check src/index.js` 会被当成 CommonJS 报错，所以先复制成 `.mjs` 再检查。
+
+---
+
+## 十二、微信「消息推送」与虚拟支付发货推送（自动发货）
+
+### 12.1 这一节解决什么问题
+
+**支付成功 ≠ 已经发货。** 发序列号 / 生成插座验证码的触发点是微信推过来的**发货推送**（事件 `xpay_goods_deliver_notify`），而微信只有在 MP 后台【开发】-【开发管理】-【消息推送】**启用并配通**之后，才会把这条消息推给你的服务器。
+
+两者是同一份配置：虚拟支付 → 道具管理 → 「发货推送配置」卡片上的「前往配置」按钮，跳转的就是【开发】-【开发管理】-【消息推送】。
+
+没配通时的典型表现：
+
+| 现象 | 数据特征 |
+|---|---|
+| 用户付款成功，但没发号/没出码 | 订单 `status = pending`、`deliver_status = pending` |
+| 后台点「重新发号」立刻正常 | `logs` 里只有 `order_create` 和 `admin_redeliver`，**没有任何 `xpay_notify_*`** |
+| 推送从没到过 | 订单 `wxOrderId` 为 `null`（推送到了会写入这个字段） |
+
+### 12.2 服务端需要支持的两件事（当前代码已实现）
+
+| 步骤 | 微信的动作 | 服务端实现 |
+|---|---|---|
+| ① URL 接入验证 | 后台点「提交」时先发 **GET** `?signature=&timestamp=&nonce=&echostr=`，要求原样返回 `echostr` | `src/index.js` 的 `apiNotifyVerify()`：`sha1(字典序(token,timestamp,nonce))` 与 `signature` 比对，通过则返回纯文本 `echostr` |
+| ② 发货推送 | 支付成功后 **POST** XML/JSON 到同一个 URL | `src/index.js` 的 `apiNotify()`：解析报文 → 按 `OutTradeNo` / `MchOrderNo` 查单 → `deliverOrder()` 发货 → 回 `<xml><ErrCode>0</ErrCode>…</xml>`（JSON 推 JSON，XML 推 XML） |
+
+> 微信对推送**最多重试 15 次**（间隔 2/4/8/16…秒），且要求 3 秒内应答；所以发货失败要尽快返回，别在回调里做耗时操作。
+
+⚠️ **最大的坑：`server.mjs` 是白名单传参。** 它把环境变量一个个显式搬进 `const env = {...}` 再交给业务代码，**不是**整个 `process.env` 透传。所以新增任何变量时，除了写 `.env`，还必须同时在 `server.mjs` 的 `env` 对象里加一行：
+
+```js
+  // 微信「消息推送」里的 Token(令牌)：GET 接入验证（echostr）用它算 sha1 签名
+  XPAY_NOTIFY_TOKEN: process.env.XPAY_NOTIFY_TOKEN || '',
+```
+
+漏了这一步的症状：`.env` 里明明有值，接口却返回 `503 notify token not configured`。
+
+### 12.3 配置步骤（照着做）
+
+**① 服务器侧**
+
+```bash
+cd /opt/wxminiapp-server
+# 1) .env 末尾加一行（不能有空格/引号，且建议文件以换行结尾）
+echo 'XPAY_NOTIFY_TOKEN=自己定的3-32位英文数字' >> .env
+# 2) 确认服务已升级到含 apiNotifyVerify 的版本
+grep -c 'apiNotifyVerify' src/index.js      # 应输出 ≥1
+grep -n 'XPAY_NOTIFY_TOKEN' server.mjs      # 应能看到白名单那一行
+# 3) 重启（改 .env 必须重启才生效）
+systemctl restart wxminiapp
+```
+
+**② 微信侧（MP 后台）**
+
+| 字段 | 填什么 |
+|---|---|
+| URL(服务器地址) | `https://你的域名/api/xpay/notify`（必须 https/80/443，公网可达） |
+| Token(令牌) | 与 `.env` 的 `XPAY_NOTIFY_TOKEN` **完全一致**（3–32 位英文/数字） |
+| EncodingAESKey | 点「随机生成」即可；**明文模式下用不到**，以后切安全模式才需要 |
+| 消息加密方式 | **明文模式**（当前代码只支持明文；安全模式是密文，会被判 `malformed`） |
+| 数据格式 | XML 或 JSON 都行，代码两种都认（推荐 XML） |
+
+点「提交」，页面不再报「服务器地址验证失败」即为配置成功；随后到 虚拟支付 → 道具管理 → 「发货推送配置」卡片里做一次 **调试/模拟推送**。
+
+> 若你用的是 Cloudflare Tunnel / Nginx 反代，注意不要拦截这个路径，也不要改写成别的地址；微信只会推你填的这个 URL。
+
+### 12.4 自检命令（只读，不改数据）
+
+```bash
+cd /opt/wxminiapp-server
+PORT=$(grep '^PORT=' .env | cut -d= -f2); PORT=${PORT:-8787}
+TOKEN=$(grep '^XPAY_NOTIFY_TOKEN=' .env | cut -d= -f2)
+
+# ① 模拟微信的 URL 接入验证：期望原样输出 HELLO（不是 503/403）
+TS=1700000000; NONCE=123
+SIG=$(printf '%s\n' "$TOKEN" "$TS" "$NONCE" | sort | tr -d '\n' | sha1sum | awk '{print $1}')
+curl -s "http://127.0.0.1:$PORT/api/xpay/notify?signature=$SIG&timestamp=$TS&nonce=$NONCE&echostr=HELLO"; echo
+
+# ② 模拟一条明文 XML 推送（假单号）：期望 <ErrCode>0</ErrCode>，日志里多一条 xpay_notify_unknown_order
+curl -s -X POST "http://127.0.0.1:$PORT/api/xpay/notify" -H 'Content-Type: text/xml' \
+  --data-binary '<xml><Event><![CDATA[xpay_goods_deliver_notify]]></Event><OutTradeNo><![CDATA[TEST_NO]]></OutTradeNo><WeChatPayInfo><![CDATA[{"MchOrderNo":"TEST_MCH"}]]></WeChatPayInfo></xml>'; echo
+```
+
+核对数据库（服务器**没装 sqlite3**，用 Node 查）：
+
+```bash
+cd /opt/wxminiapp-server
+node --experimental-sqlite -e "
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync('./data/wxminiapp.db', { readOnly: true });
+console.log('== 最近订单 ==');
+for (const o of db.prepare(\"select id,status,deliver_status,wxOrderId,datetime(createdAt,'unixepoch','+8 hours') ct from orders order by createdAt desc limit 5\").all()) console.log(o);
+console.log('== 推送相关日志 ==');
+for (const l of db.prepare(\"select action,detail,datetime(created_at,'unixepoch','+8 hours') t from logs where action like 'xpay%' order by id desc limit 20\").all()) console.log(l);
+"
+```
+
+### 12.5 排查对照
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 提交时报「服务器地址验证失败」 | 服务端没有 GET `echostr` 逻辑（旧代码），或 Token 没进 `env` | 升级 `src/index.js` + `server.mjs`；按 12.4 ①自检 |
+| 自检① 返回 `503 notify token not configured` | `server.mjs` 白名单没加该变量，或 `.env` 改了没重启 | 见 12.2 的⚠️ |
+| 自检① 返回 `403 bad signature` | `XPAY_NOTIFY_TOKEN` 与 MP 后台 Token 不一致 | 两边改成同一个串并重启 |
+| 自检① 返回 `404 not_found` | 线上跑的还是旧 `src/index.js` | 重新上传、重启 |
+| 日志 `xpay_notify_malformed`，detail 里含 `Encrypt` | 后台选了「安全模式」，代码不解密 | 把加密方式改「明文模式」 |
+| 日志 `xpay_notify_unknown_order` | 推送单号在本库查不到（改过库 / 多环境混用） | 核对 `OutTradeNo`；注意此时代码回 `ErrCode=0`，微信**不会重试** |
+| 回 `ErrCode=0` 但没发货 | 订单已是 `delivered`（幂等），或商品号不符被拒 | 查 `logs` 里的 `xpay_product_mismatch` |
+| 付款后要等很久才到账 | 推送丢失，靠人工补发 | 配 12.6 的兜底任务 |
+
+### 12.6 兜底：主动查单（推送丢了也能自动补发）
+
+`GET /api/xpay/tasks?ckey=<JWT_SECRET前16位>` 会扫描「超过 2 分钟仍未发货、且创建不超过 24 小时」的订单，逐个调 `query_order`，查到已支付就补发。
+
+```bash
+# 手动跑一次
+curl -s "http://127.0.0.1:$PORT/api/xpay/tasks?ckey=$(grep '^JWT_SECRET=' .env | cut -d= -f2 | cut -c1-16)"
+```
+
+建议挂定时任务（每 5 分钟）：
+
+```bash
+crontab -e
+*/5 * * * * curl -s "https://你的域名/api/xpay/tasks?ckey=你的JWT_SECRET前16位" >/dev/null
+```
+
+> 微信官方要求「发货推送分支」和「发货轮询分支」**至少实现一个**。本项目两条都上：推送到得快，查单兜住丢推送的情况。
+> 小程序端 `utils/xpay.js` 的 `pollOrder()` 只是读本地订单状态，**不会**主动去微信查单，所以别指望它自愈。
+
+### 12.7 上线后验证清单
+
+```
+① MP 后台消息推送 → 状态「已启用」，Token 与 .env 一致
+② 12.4 ① 输出 HELLO
+③ 虚拟支付 → 道具管理 → 发货推送配置 → 调试，后台出现 xpay_notify_verify_ok
+④ 真机付 1 单：订单 1~3 秒内 status=delivered、deliver_status=issued、wxOrderId 非空
+⑤ logs 里出现 xpay_deliver（而不是只有 admin_redeliver）
 ```

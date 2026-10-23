@@ -20,6 +20,7 @@
  */
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
+import { currentDevice } from './meta.mjs';
 import path from 'node:path';
 
 /** 后台「导出全部数据」白名单：key=下载标识，value=导出 SQL（只导业务列，不导 session_key 等敏感字段） */
@@ -29,7 +30,7 @@ const EXPORT_TABLES = {
   serials:   'SELECT id,user_id,openid,serial,category,version,source,cost,status,activated_at,claimed_at,remark FROM user_serials ORDER BY id',
   codes:     'SELECT id,user_id,openid,kind,mac,code,cost,created_at,remark FROM user_codes ORDER BY id',
   referrals: 'SELECT id,inviter_id,invitee_id,wish,created_at FROM referrals ORDER BY id',
-  logs:      'SELECT id,user_id,action,detail,ip,nickname,openid,created_at FROM logs ORDER BY id',
+  logs:      'SELECT id,user_id,action,detail,ip,nickname,openid,device,created_at FROM logs ORDER BY id',
 };
 
 /**
@@ -37,7 +38,7 @@ const EXPORT_TABLES = {
  * 整表替换：先 DELETE 再 INSERT（保留原 id / 时间），users 不走这里（按ID更新，见 importUsers）。
  */
 const IMPORT_TABLES = {
-  logs:      { table: 'logs',         columns: ['id','user_id','action','detail','ip','nickname','openid','created_at'] },
+  logs:      { table: 'logs',         columns: ['id','user_id','action','detail','ip','nickname','openid','device','created_at'] },
   orders:    { table: 'orders',       columns: ['id','outTradeNo','userId','openid','productId','productName','goodsPrice','buyQuantity','times','status','mock','note','createdAt','deliveredAt'] },
   serials:   { table: 'user_serials', columns: ['id','user_id','openid','serial','category','version','source','cost','status','activated_at','claimed_at','remark'] },
   codes:     { table: 'user_codes',   columns: ['id','user_id','openid','kind','mac','code','cost','created_at','remark'] },
@@ -55,6 +56,11 @@ CREATE TABLE IF NOT EXISTS users (
   xpay_count    INTEGER NOT NULL DEFAULT 0,
   xpay_total    INTEGER NOT NULL DEFAULT 0,
   xpay_spent    INTEGER NOT NULL DEFAULT 0,
+  -- 直购模型（2026-08）：不再有「愿望余额」，只有「免费次数」+「累计实付」
+  free_serial   INTEGER NOT NULL DEFAULT 0,   -- 剩余免费取号次数（邀请好友获得）
+  free_socket   INTEGER NOT NULL DEFAULT 0,   -- 剩余免费验证码次数
+  serial_earned INTEGER NOT NULL DEFAULT 0,   -- 累计已发放免费取号次数（防重复发放）
+  socket_earned INTEGER NOT NULL DEFAULT 0,   -- 累计已发放免费验证码次数
   status        INTEGER NOT NULL DEFAULT 0,
   remark        TEXT NOT NULL DEFAULT '',
   last_login_at INTEGER,
@@ -76,6 +82,11 @@ CREATE TABLE IF NOT EXISTS orders (
   wxOrderId    TEXT,            -- 平台单号；允许多行同值（mock 同秒碰撞），查单取最新
   mock         INTEGER NOT NULL DEFAULT 0,
   note         TEXT,            -- 发货异常备注（原 order.note）
+  -- 直购模型：一笔订单 = 一次具体服务（付完直接发结果，不产生余额）
+  kind          TEXT NOT NULL DEFAULT '',   -- serial 取号 / socket 验证码 / '' 历史愿望单
+  payload       TEXT NOT NULL DEFAULT '',   -- JSON：发号参数（category/version/链接）或 MAC 列表
+  deliver_status TEXT NOT NULL DEFAULT '',  -- pending 待发 / issued 已发 / failed 发货失败
+  deliver_result TEXT NOT NULL DEFAULT '',  -- 发号结果摘要（序列号 / 验证码 / 失败原因）
   createdAt    INTEGER,
   deliveredAt  INTEGER
 );
@@ -100,6 +111,7 @@ CREATE TABLE IF NOT EXISTS logs (
   ip         TEXT,
   nickname   TEXT,
   openid     TEXT,
+  device     TEXT DEFAULT '',
   created_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at DESC);
@@ -222,6 +234,24 @@ export class SQLiteDB {
     addCol('users', 'invited_by', 'invited_by INTEGER NOT NULL DEFAULT 0');
     addCol('users', 'invited_at', 'invited_at INTEGER NOT NULL DEFAULT 0');
     addCol('users', 'new_gift', 'new_gift INTEGER NOT NULL DEFAULT 0');
+    // 审计日志：客户端设备串（平台|厂商|机型|系统|微信版本|基础库|屏幕）
+    // 不加 NOT NULL：导入旧 CSV（没有 device 列）时会是 NULL，避免整表导入报错
+    addCol('logs', 'device', "device TEXT DEFAULT ''");
+
+    // 一次性改名：旧道具名「愿望N个」统一改成中性名，避免被判定为虚拟货币。
+    // 只改还能匹配旧命名的行，所以可重复执行；后台自定义过的名字不会被覆盖。
+    try {
+      this.db.prepare("UPDATE products SET name = '高级功能1次' WHERE name LIKE '愿望%'").run();
+    } catch { /* products 表还不存在时忽略 */ }
+    // 直购模型（2026-08）：免费次数 + 累计实付；orders 区分服务类型与发货结果
+    addCol('users', 'free_serial', 'free_serial INTEGER NOT NULL DEFAULT 0');
+    addCol('users', 'free_socket', 'free_socket INTEGER NOT NULL DEFAULT 0');
+    addCol('users', 'serial_earned', 'serial_earned INTEGER NOT NULL DEFAULT 0');
+    addCol('users', 'socket_earned', 'socket_earned INTEGER NOT NULL DEFAULT 0');
+    addCol('orders', 'kind', "kind TEXT NOT NULL DEFAULT ''");
+    addCol('orders', 'payload', "payload TEXT NOT NULL DEFAULT ''");
+    addCol('orders', 'deliver_status', "deliver_status TEXT NOT NULL DEFAULT ''");
+    addCol('orders', 'deliver_result', "deliver_result TEXT NOT NULL DEFAULT ''");
   }
 
   // ─────────── settings（后台可配置项 key-value） ───────────
@@ -249,20 +279,27 @@ export class SQLiteDB {
     // 按 openid 冲突时只更新业务字段，id 保持首次注册时分配的值不变
     this.db.prepare(`
       INSERT INTO users (id, openid, unionid, session_key, nickname, phone,
-                         xpay_count, xpay_total, xpay_spent, status, remark,
+                         xpay_count, xpay_total, xpay_spent,
+                         free_serial, free_socket, serial_earned, socket_earned,
+                         status, remark,
                          last_login_at, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(openid) DO UPDATE SET
         unionid=excluded.unionid, session_key=excluded.session_key,
         nickname=excluded.nickname, phone=excluded.phone,
         xpay_count=excluded.xpay_count, xpay_total=excluded.xpay_total,
-        xpay_spent=excluded.xpay_spent, status=excluded.status,
+        xpay_spent=excluded.xpay_spent,
+        free_serial=excluded.free_serial, free_socket=excluded.free_socket,
+        serial_earned=excluded.serial_earned, socket_earned=excluded.socket_earned,
+        status=excluded.status,
         remark=excluded.remark, last_login_at=excluded.last_login_at,
         updated_at=excluded.updated_at
     `).run(
       Number(u.id), u.openid, u.unionid ?? null, u.session_key ?? null,
       String(u.nickname ?? ''), String(u.phone ?? ''),
       Number(u.xpay_count ?? 0), Number(u.xpay_total ?? 0), Number(u.xpay_spent ?? 0),
+      Number(u.free_serial ?? 0), Number(u.free_socket ?? 0),
+      Number(u.serial_earned ?? 0), Number(u.socket_earned ?? 0),
       Number(u.status ?? 0), String(u.remark ?? ''),
       Number(u.last_login_at ?? 0), Number(u.created_at ?? 0), Number(u.updated_at ?? 0)
     );
@@ -356,8 +393,10 @@ export class SQLiteDB {
 
   /**
    * 批量导入 / 修改用户（按用户ID匹配，只更新已存在用户，ID 不存在则跳过）。
-   * @param {Array<{id:number|string, xpay_count?:number|string, nickname?:string, phone?:string}>} rows
-   *   xpay_count 提供即「设置为该值」（非负整数），留空不改；nickname/phone 留空不改。
+   * @param {Array<{id:number|string, free_serial?:number|string, free_socket?:number|string,
+   *                nickname?:string, phone?:string}>} rows
+   *   免费次数提供即「设置为该值」（非负整数），留空不改；nickname/phone 留空不改。
+   *   已经不再接受「愿望余额」字段（模型已下线）。
    * @returns {{updated:number, skipped:number, errors:string[]}}
    */
   importUsers(rows) {
@@ -366,7 +405,7 @@ export class SQLiteDB {
     const now = Math.floor(Date.now() / 1000);
     const sel = this.db.prepare('SELECT * FROM users WHERE id = ?');
     const upd = this.db.prepare(
-      'UPDATE users SET xpay_count = ?, nickname = ?, phone = ?, updated_at = ? WHERE id = ?'
+      'UPDATE users SET free_serial = ?, free_socket = ?, nickname = ?, phone = ?, updated_at = ? WHERE id = ?'
     );
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -375,18 +414,33 @@ export class SQLiteDB {
         if (!Number.isInteger(id) || id <= 0) { errors.push(`非法用户ID：${row.id}`); skipped++; continue; }
         const cur = sel.get(id);
         if (!cur) { errors.push(`ID ${id} 不存在，已跳过`); skipped++; continue; }
-        let balance = Number(cur.xpay_count || 0);
+
+        let freeSerial = Number(cur.free_serial || 0);
+        let freeSocket = Number(cur.free_socket || 0);
         let nick = cur.nickname || '';
         let phone = cur.phone || '';
-        const bRaw = row.xpay_count;
-        if (bRaw !== undefined && bRaw !== null && String(bRaw).trim() !== '') {
-          const n = Math.floor(Number(bRaw));
-          if (!Number.isInteger(n) || n < 0) { errors.push(`ID ${id} 余额「${bRaw}」非法，已跳过该行`); continue; }
-          balance = n;
-        }
+
+        /** 解析非负整数：空 → null（不改）；非法 → undefined（跳过整行） */
+        const readNum = (raw, label) => {
+          if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+          const n = Math.floor(Number(raw));
+          if (!Number.isInteger(n) || n < 0) {
+            errors.push(`ID ${id} ${label}「${raw}」非法，已跳过该行`);
+            return undefined;
+          }
+          return n;
+        };
+        const fs = readNum(row.free_serial, '免费取号次数');
+        if (fs === undefined) { skipped++; continue; }
+        if (fs !== null) freeSerial = fs;
+
+        const fk = readNum(row.free_socket, '免费验证码次数');
+        if (fk === undefined) { skipped++; continue; }
+        if (fk !== null) freeSocket = fk;
+
         if (row.nickname !== undefined && String(row.nickname).trim() !== '') nick = String(row.nickname).slice(0, 100);
         if (row.phone !== undefined && String(row.phone).trim() !== '') phone = String(row.phone).slice(0, 30);
-        upd.run(balance, nick, phone, now, id);
+        upd.run(freeSerial, freeSocket, nick, phone, now, id);
         updated++;
       }
       this.db.exec('COMMIT');
@@ -485,8 +539,9 @@ export class SQLiteDB {
     this.db.prepare(`
       INSERT INTO orders (id, outTradeNo, userId, openid, productId, productName,
                           goodsPrice, buyQuantity, times, status, wxOrderId,
-                          mock, note, createdAt, deliveredAt)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          mock, note, kind, payload, deliver_status, deliver_result,
+                          createdAt, deliveredAt)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET
         outTradeNo=excluded.outTradeNo, userId=excluded.userId,
         openid=excluded.openid, productId=excluded.productId,
@@ -494,6 +549,8 @@ export class SQLiteDB {
         buyQuantity=excluded.buyQuantity, times=excluded.times,
         status=excluded.status, wxOrderId=excluded.wxOrderId,
         mock=excluded.mock, note=excluded.note,
+        kind=excluded.kind, payload=excluded.payload,
+        deliver_status=excluded.deliver_status, deliver_result=excluded.deliver_result,
         createdAt=excluded.createdAt, deliveredAt=excluded.deliveredAt
     `).run(
       o.id, o.outTradeNo ?? null, Number(o.userId ?? 0), o.openid ?? null,
@@ -501,6 +558,8 @@ export class SQLiteDB {
       Number(o.goodsPrice ?? 0), Number(o.buyQuantity ?? 1), Number(o.times ?? 0),
       o.status ?? 'pending', o.wxOrderId || null,     // 空串转 NULL，避免 UNIQUE/查询歧义
       o.mock ? 1 : 0, o.note ?? null,
+      String(o.kind ?? ''), String(o.payload ?? ''),
+      String(o.deliver_status ?? ''), String(o.deliver_result ?? ''),
       Number(o.createdAt ?? 0), Number(o.deliveredAt ?? 0)
     );
   }
@@ -533,19 +592,36 @@ export class SQLiteDB {
 
   // ─────────── logs ───────────
 
-  addLog({ userId, action, detail, ip, nickname, openid }) {
+  addLog({ userId, action, detail, ip, nickname, openid, device }) {
+    // device 不传就取当前请求的设备串（见 meta.mjs），调用点无需关心
+    const dev = String(device == null ? currentDevice() : device);
     this.db.prepare(`
-      INSERT INTO logs (user_id, action, detail, ip, nickname, openid, created_at)
-      VALUES (?,?,?,?,?,?,?)
+      INSERT INTO logs (user_id, action, detail, ip, nickname, openid, device, created_at)
+      VALUES (?,?,?,?,?,?,?,?)
     `).run(
       Number(userId ?? 0), String(action ?? ''), String(detail ?? ''),
       String(ip ?? ''), String(nickname ?? ''), String(openid ?? ''),
+      dev.slice(0, 200),
       Math.floor(Date.now() / 1000)
     );
   }
-  listLogs(limit, offset) {
-    return this.db.prepare('SELECT * FROM logs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?')
-      .all(Number(limit) || 20, Number(offset) || 0);
+  /**
+   * 审计日志分页
+   * @param {number} limit
+   * @param {number} offset
+   * @param {'ios'|'android'|'other'|''} platform 按设备平台筛选（对应 device 列的前缀）
+   */
+  listLogs(limit, offset, platform) {
+    const where = [];
+    const args = [];
+    if (platform === 'ios')    { where.push("device LIKE 'ios|%'");     }
+    else if (platform === 'android') { where.push("device LIKE 'android|%'"); }
+    else if (platform === 'other')   { where.push("device <> '' AND device NOT LIKE 'ios|%' AND device NOT LIKE 'android|%'"); }
+    const sql = 'SELECT * FROM logs'
+      + (where.length ? ' WHERE ' + where.join(' AND ') : '')
+      + ' ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?';
+    args.push(Number(limit) || 20, Number(offset) || 0);
+    return this.db.prepare(sql).all(...args);
   }
 
   // ─────────── user_serials（用户领取的序列号） ───────────
@@ -622,26 +698,28 @@ export class SQLiteDB {
   }
 
   /**
-   * 取号落库 + 扣愿望，同一个事务里做完，任何一步失败全部撤销。
-   *   cost > 0：先扣 users.xpay_count，余额不足直接返回 need_wish（不发号、不扣）
+   * 取号落库 + 扣免费次数，同一个事务里做完，任何一步失败全部撤销。
+   *   credit = 1：先扣 users.free_serial，没有免费次数直接返回 need_credit（不发号、不扣）
    *   返回值 error：
-   *     need_wish       余额不足
+   *     need_credit     没有免费取号次数（调用方应转成付费下单）
    *     serial_taken    这个号已经被别人领走（不是我们的号，别动它）
    *     free_taken      免费额度被别人并发抢了（这条调用方应改成付费重试）
    *     duplicate_request  同一个 request_id 已经发过（幂等）
    *     db_error        其它数据库错误
    */
-  claimSerialTx({ userId, cost = 0, row }) {
+  claimSerialTx({ userId, credit = 0, cost = 0, row }) {
     const ts = Math.floor(Date.now() / 1000);
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if (Number(cost) > 0) {
+      // 只认「免费次数」；cost 仅用于记录这一单实付金额（不再扣任何余额）
+      void cost;
+      if (Number(credit) > 0) {
         const r = this.db.prepare(
-          'UPDATE users SET xpay_count = xpay_count - ?, updated_at = ? WHERE id = ? AND xpay_count >= ?'
-        ).run(Number(cost), ts, Number(userId), Number(cost));
+          'UPDATE users SET free_serial = free_serial - 1, updated_at = ? WHERE id = ? AND free_serial > 0'
+        ).run(ts, Number(userId));
         if (Number(r.changes) !== 1) {
           this.db.exec('ROLLBACK');
-          return { ok: false, error: 'need_wish' };
+          return { ok: false, error: 'need_credit' };
         }
       }
       this.addUserSerial(row);
@@ -675,11 +753,29 @@ export class SQLiteDB {
     ).get(Number(inviterId)).c || 0);
   }
 
-  /** 我靠邀请一共拿到多少愿望 */
+  /** 我靠邀请一共拿到多少份额（旧字段，保留兼容；新逻辑看 free_serial / free_socket） */
   sumInviteWish(inviterId) {
     return Number(this.db.prepare(
       'SELECT COALESCE(SUM(wish), 0) AS s FROM referrals WHERE inviter_id = ?'
     ).get(Number(inviterId)).s || 0);
+  }
+
+  /**
+   * 发放免费次数（邀请奖励）：把用户剩余次数加上 add，并把「累计已发放」同步为 earned。
+   * 用 earned 做幂等依据：应发 = floor(邀请人数 / 门槛)，只补发差额，重复调用不会多发。
+   * @param {'serial'|'socket'} kind
+   */
+  grantFreeCreditsTx({ userId, kind, add = 0, earned = 0 }) {
+    const isSocket = kind === 'socket';
+    const col = isSocket ? 'free_socket' : 'free_serial';
+    const ecol = isSocket ? 'socket_earned' : 'serial_earned';
+    const n = Math.max(0, Math.floor(Number(add) || 0));
+    const e = Math.max(0, Math.floor(Number(earned) || 0));
+    const ts = Math.floor(Date.now() / 1000);
+    this.db.prepare(
+      `UPDATE users SET ${col} = ${col} + ?, ${ecol} = ?, updated_at = ? WHERE id = ?`
+    ).run(n, e, ts, Number(userId));
+    return { ok: true, add: n, earned: e };
   }
 
   /**
@@ -732,10 +828,9 @@ export class SQLiteDB {
       ).run(inviter, ts, ts, invitee);
       if (Number(r.changes) !== 1) { this.db.exec('ROLLBACK'); return { ok: false, error: 'already_bound' }; }
 
-      if (w > 0) {
-        this.db.prepare('UPDATE users SET xpay_count = xpay_count + ?, updated_at = ? WHERE id = ?')
-          .run(w, ts, inviter);
-      }
+      // 直购模型：这里只落绑定关系，不再动任何余额。
+      // 免费次数由调用方按「邀请门槛」算好，再调 grantFreeCreditsTx 发放（幂等）。
+      void w;
 
       this.db.exec('COMMIT');
       return { ok: true, wish: w, at: ts };
@@ -846,12 +941,12 @@ export class SQLiteDB {
   // ─────────── 智能插座验证码（user_codes / code_batches） ───────────
 
   /**
-   * 生成验证码的记录 + 扣愿望，一个事务做完：
+   * 生成验证码的记录 + 扣免费次数，一个事务做完：
    *   request_id 已存在   → duplicate_request（调用方返回上次结果，不重复扣）
-   *   余额不足            → need_wish（不落库、不扣）
+   *   没有免费次数        → need_credit（不落库、不扣）
    *   rows 里的 mac/code 由调用方算好传入
    */
-  createCodeBatchTx({ userId, requestId, cost = 0, rows = [] }) {
+  createCodeBatchTx({ userId, requestId, credit = 0, cost = 0, rows = [] }) {
     const ts = Math.floor(Date.now() / 1000);
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -859,13 +954,14 @@ export class SQLiteDB {
         'INSERT INTO code_batches (request_id, user_id, count, cost, created_at) VALUES (?,?,?,?,?)'
       ).run(String(requestId), Number(userId), rows.length, Number(cost), ts);
 
-      if (Number(cost) > 0) {
+      // 只认「免费次数」；cost 仅记录本单实付金额（不再扣任何余额）
+      if (Number(credit) > 0) {
         const r = this.db.prepare(
-          'UPDATE users SET xpay_count = xpay_count - ?, updated_at = ? WHERE id = ? AND xpay_count >= ?'
-        ).run(Number(cost), ts, Number(userId), Number(cost));
+          'UPDATE users SET free_socket = free_socket - 1, updated_at = ? WHERE id = ? AND free_socket > 0'
+        ).run(ts, Number(userId));
         if (Number(r.changes) !== 1) {
           this.db.exec('ROLLBACK');
-          return { ok: false, error: 'need_wish' };
+          return { ok: false, error: 'need_credit' };
         }
       }
 
